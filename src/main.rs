@@ -191,7 +191,10 @@ impl Workspace {
             return check_interrupt();
         }
         if !io::stdin().is_terminal() {
-            return Err("approval requires a terminal or explicit --yes".into());
+            return Err(
+                "approval requires a terminal; omit --ask or pass --yes to allow automatically"
+                    .into(),
+            );
         }
         eprint!("Allow with full user privileges? [y/N] ");
         io::stderr().flush()?;
@@ -448,21 +451,22 @@ fn turn(
 }
 
 fn run() -> Result<()> {
-    let mut provider = std::env::var("AGENT_PROVIDER").unwrap_or("openai".into());
-    let mut model = std::env::var("AGENT_MODEL").unwrap_or_default();
-    let mut yes = false;
+    let mut provider = std::env::var("AGENT_PROVIDER").unwrap_or("codex".into());
+    let mut model = std::env::var("AGENT_MODEL").unwrap_or("gpt-6.1-sol".into());
+    let mut yes = true;
     let mut max_turns = 20;
     let mut prompt = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--yes" => yes = true,
+            "--ask" => yes = false,
             "--provider" => provider = args.next().ok_or("--provider needs a value")?,
             "--model" => model = args.next().ok_or("--model needs a value")?,
             "--max-turns" => max_turns = args.next().ok_or("--max-turns needs a value")?.parse()?,
             "--help" | "-h" => {
                 println!(
-                    "agent [--provider openai|anthropic|openrouter|codex] --model MODEL [--yes] [--max-turns N] [--] [PROMPT...]\nNo prompt: interactive conversation. /quit exits, /clear resets history.\n--yes allows unsandboxed shell commands and file writes without confirmation."
+                    "agent [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--max-turns N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nNo prompt: interactive conversation. /quit exits, /clear resets history.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval."
                 );
                 return Ok(());
             }

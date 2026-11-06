@@ -29,14 +29,14 @@ export OPENAI_API_KEY='...'
 
 Run the binary **from the directory you want it to work in**. Options precede the prompt. No prompt starts a line-oriented conversation; `/clear` resets history and `/quit` exits. Use `--` before a prompt beginning with `-`.
 
-`AGENT_PROVIDER` (default `openai`) and `AGENT_MODEL` can replace the corresponding flags. Keys are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`. The CLI does not load `.env`.
+The defaults are provider `codex` and model `gpt-6.1-sol`. `AGENT_PROVIDER` and `AGENT_MODEL` override these defaults; the corresponding command-line flags take precedence. Keys are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`. The CLI does not load `.env`.
 
 ### One-command Codex launch
 
 From this repository, using your current fx Codex login:
 
 ```sh
-cargo run --release -- --provider codex --model gpt-6.1-sol
+cargo run --release
 ```
 
 `src/auth.rs` owns authentication/profile discovery; `llm-api` only receives the access token and account ID. Codex credential precedence is:
@@ -56,7 +56,7 @@ A fully independent browser/device OAuth login and refresh flow belongs in this 
 - `write_file`: create or replace a file; existing parent required. Atomic sibling-file replacement preserves existing permissions, not hard-link identity, extended attributes, or inode metadata. New files are private (`0600`).
 - `shell`: `/bin/sh -c` in the startup working directory. Results include exit status, stdout, and stderr.
 
-Writes and shell commands show their full arguments and require literal `y`. Noninteractive use denies them unless **you explicitly pass `--yes`**, which grants arbitrary shell execution with your user privileges. Reads are automatic. Unknown tools/fields and incorrect argument types are rejected locally.
+**All valid tool calls are allowed without confirmation by default**, including arbitrary shell execution with your full user privileges. Writes and shell commands still show their full arguments. Pass `--ask` to require literal `y` for writes and shell commands (noninteractive use then denies them); `--yes` restores automatic approval. Reads are automatic in either mode. Unknown tools/fields and incorrect argument types are rejected locally.
 
 File tools reject resolved paths outside the startup directory. These checks and approvals are **not a sandbox**: concurrent symlink/directory swaps can race checks, reads can expose workspace secrets, and approved shell commands have unrestricted host access. Use trusted projects or external OS isolation. Root `AGENTS.md` is loaded automatically; the model is instructed to read applicable nested guides, but that is not mechanically enforced.
 
