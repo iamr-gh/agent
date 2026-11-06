@@ -1,3 +1,5 @@
+mod auth;
+
 use llm_api::{Client, Message, Provider, Request, Response, Result};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -20,9 +22,75 @@ extern "C" fn interrupt(_: libc::c_int) {
 }
 fn check_interrupt() -> Result<()> {
     if INTERRUPTED.load(Ordering::Relaxed) {
-        return Err("interrupted".into());
+        return Err(llm_api::Cancelled.into());
     }
     Ok(())
+}
+
+struct StdinFlags(libc::c_int);
+impl Drop for StdinFlags {
+    fn drop(&mut self) {
+        // SAFETY: restore the original flags on the process-owned stdin descriptor.
+        unsafe {
+            libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, self.0);
+        }
+    }
+}
+
+// No stdio prefetch; nonblocking read handles a Ctrl-C flush between poll and read.
+fn input_line() -> Result<String> {
+    // SAFETY: fcntl does not take ownership of stdin.
+    let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let _restore = StdinFlags(flags);
+    if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut input = Vec::new();
+    loop {
+        check_interrupt()?;
+        let mut fd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: fd is a live stack value; poll borrows it only for this call.
+        let ready = unsafe { libc::poll(&mut fd, 1, 25) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut byte = [0];
+        // SAFETY: byte is writable for one byte; stdin ownership stays with the process.
+        let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+        if n < 0 {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if n == 0 {
+            break;
+        }
+        input.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    check_interrupt()?;
+    Ok(String::from_utf8(input)?)
 }
 
 fn text(role: &str, value: String) -> Message {
@@ -127,8 +195,7 @@ impl Workspace {
         }
         eprint!("Allow with full user privileges? [y/N] ");
         io::stderr().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
+        let answer = input_line()?;
         check_interrupt()?;
         if answer.trim() != "y" {
             return Err("denied by user".into());
@@ -331,6 +398,7 @@ fn turn(
             );
         }
         let response = infer(request)?;
+        check_interrupt()?;
         let calls: Vec<_> = response
             .message
             .content
@@ -415,10 +483,7 @@ fn run() -> Result<()> {
     }
     let provider: Provider = serde_json::from_value(json!(provider))?;
     let client = match provider {
-        Provider::Codex => Client::codex(
-            std::env::var("CODEX_ACCESS_TOKEN")?,
-            std::env::var("CODEX_ACCOUNT_ID")?,
-        )?,
+        Provider::Codex => auth::codex_client()?,
         _ => {
             let key = match provider {
                 Provider::Anthropic => "ANTHROPIC_API_KEY",
@@ -452,6 +517,16 @@ fn run() -> Result<()> {
             workspace.read(&workspace.path("AGENTS.md")?)?
         ));
     }
+    chat(client, workspace, request, prompt, max_turns)
+}
+
+fn chat(
+    client: Client,
+    workspace: Workspace,
+    mut request: Request,
+    prompt: Vec<String>,
+    max_turns: usize,
+) -> Result<()> {
     let interactive = prompt.is_empty();
     if interactive && !io::stdin().is_terminal() {
         return Err("provide a prompt argument for noninteractive use".into());
@@ -460,8 +535,16 @@ fn run() -> Result<()> {
         let input = if interactive {
             eprint!("\n> ");
             io::stderr().flush()?;
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input)? == 0 {
+            let input = match input_line() {
+                Ok(input) => input,
+                Err(e) if e.is::<llm_api::Cancelled>() => {
+                    INTERRUPTED.store(false, Ordering::Relaxed);
+                    eprintln!("cancelled");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if input.is_empty() {
                 break;
             }
             match input.trim() {
@@ -477,8 +560,8 @@ fn run() -> Result<()> {
             prompt.join(" ")
         };
         request.messages.push(text("user", input));
-        turn(&mut request, &workspace, max_turns, |req| {
-            let result = client.run(req, |event| {
+        let result = turn(&mut request, &workspace, max_turns, |req| {
+            let result = client.run_cancellable(req, &INTERRUPTED, |event| {
                 if check_interrupt().is_err() {
                     return false;
                 }
@@ -490,7 +573,13 @@ fn run() -> Result<()> {
             });
             println!();
             result
-        })?;
+        });
+        if interactive && INTERRUPTED.swap(false, Ordering::Relaxed) {
+            request.messages.push(text("user", "Previous turn cancelled. Completed tool effects may remain; inspect state before retrying anything.".into()));
+            eprintln!("cancelled; completed changes were not rolled back");
+            continue;
+        }
+        result?;
         if !interactive {
             break;
         }
@@ -498,14 +587,24 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn main() {
+fn install_interrupt_handler() {
     // SAFETY: handler only sets a lock-free atomic flag and never calls Rust I/O.
     unsafe {
         libc::signal(libc::SIGINT, interrupt as *const () as libc::sighandler_t);
     }
+}
+
+fn main() {
+    install_interrupt_handler();
     if let Err(error) = run() {
         eprintln!("agent: {}", display(&error.to_string()));
-        std::process::exit(1);
+        std::process::exit(
+            if INTERRUPTED.load(Ordering::Relaxed) || error.is::<llm_api::Cancelled>() {
+                130
+            } else {
+                1
+            },
+        );
     }
 }
 

@@ -14,12 +14,16 @@ The reviews' broader lessons are reflected in the boundary choices: the first-pa
 
 `llm-api` owns provider selection, encoding, streaming normalization, authentication headers, usage, finish reasons, and native replay. `agent` owns the conversation, prompt, tool schemas, argument checks, approval, filesystem effects, subprocesses, and terminal rendering. Current `llm-api` providers are OpenAI, Anthropic, OpenRouter, and Codex; its older README provider roster is not authoritative.
 
-There is one sequential loop: user message → `Client::run` → intact assistant message → validated/authorized tools → user-role results → next request. Failed tools are observable results. Model/protocol/budget errors terminate rather than silently retrying effects. Output control characters are escaped before terminal rendering, but the model receives the raw bounded output.
+There is one sequential loop: user message → `Client::run_cancellable` → intact assistant message → validated/authorized tools → user-role results → next request. Failed tools are observable results. Model/protocol/budget errors terminate rather than silently retrying effects. Output control characters are escaped before terminal rendering, but the model receives the raw bounded output.
+
+`src/auth.rs` owns Codex credential discovery: explicit environment credentials, an agent-owned version-1 profile, then a read-only fx compatibility profile. It never writes a login, refreshes a token, or moves auth discovery into `llm-api`. A native OAuth flow can later replace the compatibility bridge without changing the transport API; an agent-owned access-token file alone does not implement login/refresh.
 
 The only direct dependencies besides `llm-api` are `serde_json` and `libc`. Serialization is already in the interface layer's dependency graph. `libc` provides Unix nonblocking pipes, process-group cleanup, and signal handling without an async runtime. The application is intentionally Unix-only for now; this does not add platform assumptions to the portable `llm-api` library.
 
 ## Next boundaries, not initial features
 
-A genuinely responsive UI with cancellation during an idle provider read will need a portable cancellation/deadline facility in `llm-api`, or process isolation of model requests. Its current event callback alone does not provide that guarantee. This limitation is documented rather than patched into the concurrently edited dependency without coordination.
+Cancellation now uses `llm-api::Client::run_cancellable` with the signal handler's atomic flag. The library owns per-request socket shutdown and its scoped monitor; Unix signal/input/process handling stays in this application. Input uses temporarily nonblocking byte reads with descriptor flags restored on scope exit, avoiding stdio prefetch and the terminal-flush race between poll and read. Interactive interruption keeps complete transcript messages and settled tool results, records a warning about effects, clears the flag only after request cleanup, and returns to the prompt. Batch interruption exits 130. No automatic side-effect retry or rollback is attempted.
+
+A fully responsive editing/steering UI remains deferred. DNS/connect cancellation is bounded rather than immediate; arbitrary callbacks and filesystem operations cannot be forcibly interrupted, and detached shell jobs may escape process-group cleanup.
 
 Other deferred work: transcript persistence with explicit no-replay semantics for effects; prompt revisions/forks; model-aware context budgeting and explicit compaction; hierarchical instruction enforcement; stronger path traversal using anchored descriptors; and external sandboxing. None is implied by the current approval prompt or path checks.

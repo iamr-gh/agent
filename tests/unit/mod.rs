@@ -385,3 +385,6 @@ fn noninteractive_approval_fails_closed() {
         assert!(!fixture.0.root.join("a").exists());
     }
 }
+
+#[path = "cancellation.rs"]
+mod cancellation;

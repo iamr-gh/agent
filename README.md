@@ -29,7 +29,25 @@ export OPENAI_API_KEY='...'
 
 Run the binary **from the directory you want it to work in**. Options precede the prompt. No prompt starts a line-oriented conversation; `/clear` resets history and `/quit` exits. Use `--` before a prompt beginning with `-`.
 
-`AGENT_PROVIDER` (default `openai`) and `AGENT_MODEL` can replace the corresponding flags. Keys are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`. Codex uses `--provider codex`, `CODEX_ACCESS_TOKEN`, and `CODEX_ACCOUNT_ID`; token acquisition/refresh belongs outside this CLI. The CLI does not read `.env` or another tool's credentials.
+`AGENT_PROVIDER` (default `openai`) and `AGENT_MODEL` can replace the corresponding flags. Keys are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`. The CLI does not load `.env`.
+
+### One-command Codex launch
+
+From this repository, using your current fx Codex login:
+
+```sh
+cargo run --release -- --provider codex --model gpt-6.1-sol
+```
+
+`src/auth.rs` owns authentication/profile discovery; `llm-api` only receives the access token and account ID. Codex credential precedence is:
+
+1. Both `CODEX_ACCESS_TOKEN` and `CODEX_ACCOUNT_ID`, if supplied. Supplying only one is an error.
+2. `$AGENT_HOME/codex-auth.json`, or `~/.agent/codex-auth.json` by default.
+3. Compatibility fallback: `$FX_HOME/chatgpt-auth.json`, or `~/.fx/chatgpt-auth.json`.
+
+File profiles must be private, user-owned regular files, not symlinks. The version-1 schema needs `access_token`, `account_id`, and `expires_at_ms` at least 60 seconds in the future. Existing files are read-only: nothing is copied, printed, rotated, or refreshed. An invalid agent-owned profile fails rather than silently falling back. Environment credentials or an agent-owned profile avoid any fx runtime dependency; acquiring/refreshing those credentials is still external.
+
+A fully independent browser/device OAuth login and refresh flow belongs in this application's auth module (or a separate reusable auth crate), not the provider transport library. It is not implemented yet. If the existing fx token expires, renew the login in fx and rerun the command.
 
 ### Tools and authority
 
@@ -49,9 +67,10 @@ File tools reject resolved paths outside the startup directory. These checks and
 - Shell deadline: 60 seconds; subprocess stdin is closed. Process-group cleanup also runs after normal shell completion. Detached jobs can escape cleanup, but cannot keep the output collector waiting indefinitely.
 - Context: 512 KiB serialized request guard, **not a model-specific token counter**. Full history and opaque replay are kept until `/clear` or exit; nothing is silently compacted.
 - Only finalized `tool_calls` responses execute tools. Incomplete responses, malformed IDs, provider errors, context exhaustion, and turn exhaustion stop with exit 1. Tool failures become matching results for the model; there are no automatic side-effect retries.
-- Ctrl-C is cooperative: shell work is cleaned up at the next polling boundary; streaming is cancelled at the next event. `llm-api` currently has a 180-second request timeout and no independently interruptible idle network read. This is not yet a nonblocking TUI or a prompt-revision interface.
+- Ctrl-C cancels the current interactive turn and returns to the prompt, including while waiting for input or approval. During a model request it uses `llm-api::Client::run_cancellable` to close idle sockets without waiting for another event. Shell process-group cleanup runs before continuing. Batch cancellation exits 130. DNS/connect stages may still take up to five seconds each; callbacks and file writes are not forcibly preempted. This is not yet a nonblocking TUI or a prompt-revision interface.
+- Cancellation is not rollback: completed changes remain. Partial model output is not appended as an assistant response; advertised tool calls retain matching results, including interrupted/unstarted calls. History gains an interruption note, and later turns are told to inspect state before retrying effects. Context is retained unless you use `/clear`.
 
-There is no persistence, automatic resume, background task manager, subagent system, MCP, or model catalog yet. A final model answer is not proof that its code or tests are correct. No changes to `llm-api` were needed for this first implementation.
+There is no persistence, automatic resume, background task manager, subagent system, MCP, or model catalog yet. A final model answer is not proof that its code or tests are correct. Provider protocols remain in `llm-api`; cancellation uses its standard-library atomic-flag API.
 
 ## Verification
 
@@ -62,5 +81,7 @@ cargo clippy --locked --offline --all-targets -- -D warnings
 ```
 
 Tests use temporary workspaces, fabricated responses, local subprocesses, and a loopback HTTP server exercising the real `llm-api::Client` tool/reasoning round trip. They require no credentials or paid model requests. Production code is in `src/main.rs`; the prompt and tests are separate.
+
+Opt-in live CLI checks are in `tests/live.py`; `--scenario code` exercises a real Rust bug fix with independently recompiled tests. For example, `python3 -u tests/live.py --provider codex --model gpt-6.1-sol --scenario code` uses a disposable workspace and normal approval prompts, with the existing read-only login bridge. See [live results](docs/LIVE_TESTS.md) for the provider matrix, exact commands, and the preserved OpenRouter newline failure.
 
 See [design notes](docs/DESIGN.md) for the research references and intentional omissions.
