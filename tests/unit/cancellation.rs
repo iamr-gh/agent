@@ -21,6 +21,7 @@ fn process_helper() {
     let workspace = Workspace {
         root: PathBuf::from(std::env::var_os("AGENT_CANCEL_WORKSPACE").unwrap()),
         yes: std::env::var("AGENT_CANCEL_APPROVAL").as_deref() != Ok("1"),
+        verbose: false,
     };
     let prompt = if std::env::var("AGENT_CANCEL_BATCH").as_deref() == Ok("1") {
         vec!["task".into()]
@@ -29,7 +30,7 @@ fn process_helper() {
     };
     let mut req = request();
     req.messages.clear();
-    let result = chat(client, workspace, req, prompt, 5);
+    let result = chat(client, workspace, req, prompt, 5, 4 * 1024 * 1024);
     let cancelled = INTERRUPTED.load(Ordering::Relaxed)
         || result
             .as_ref()
@@ -69,7 +70,13 @@ impl Process {
             .env("AGENT_CANCEL_BATCH", if interactive { "0" } else { "1" });
         let terminal = if interactive {
             let (mut master, mut slave): (RawFd, RawFd) = (-1, -1);
-            // SAFETY: openpty initializes both descriptors; optional parameters are null.
+            let mut size = libc::winsize {
+                ws_row: 24,
+                ws_col: 40,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // SAFETY: openpty initializes both descriptors and borrows size.
             assert_eq!(
                 unsafe {
                     libc::openpty(
@@ -77,7 +84,7 @@ impl Process {
                         &mut slave,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
-                        std::ptr::null_mut(),
+                        &mut size,
                     )
                 },
                 0
@@ -143,8 +150,22 @@ impl Process {
         self.terminal
             .as_mut()
             .unwrap()
-            .write_all(input.as_bytes())
+            .write_all(input.replace('\n', "\r").as_bytes())
             .unwrap();
+        // Emulate an emulator continuously draining redraw output, including
+        // when a test types or erases thousands of characters before submitting.
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            let mut bytes = [0; 8192];
+            match self.terminal.as_mut().unwrap().read(&mut bytes) {
+                Ok(n) => self.output.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("terminal read: {e}"),
+            }
+        }
     }
 
     fn interrupt(&self) {
@@ -321,6 +342,41 @@ fn assert_closed(stream: &mut TcpStream) {
             ) => {}
         other => panic!("cancelled transport must close its peer: {other:?}"),
     }
+}
+
+#[test]
+fn long_input_backspaces_across_viewports_and_submits_exact_text() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    process.send("keep this ");
+    // Exceed both macOS and Linux canonical line limits, then erase everything
+    // beyond the prefix, across many 40-column viewport boundaries.
+    for _ in 0..6 {
+        process.send(&"x".repeat(1000));
+    }
+    for _ in 0..6 {
+        process.send(&"\x7f".repeat(1000));
+    }
+    process.send("界e\u{301}");
+    process.send("\x7f\x7f"); // erase graphemes, not UTF-8 bytes
+    process.send("finished\n");
+    let (stream, body) = server.request();
+    assert!(
+        body["input"].as_array().unwrap().iter().any(|message| {
+            message["role"] == "user"
+                && message["content"].as_array().is_some_and(|content| {
+                    content
+                        .iter()
+                        .any(|part| part["text"] == "keep this finished\n")
+                })
+        }),
+        "unexpected submitted input: {body}"
+    );
+    done(stream);
+    process.expect("> ");
+    process.quit();
 }
 
 #[test]

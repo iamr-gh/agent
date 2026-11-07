@@ -14,6 +14,7 @@ impl Fixture {
         Self(Workspace {
             root: root.canonicalize().unwrap(),
             yes: true,
+            verbose: false,
         })
     }
 }
@@ -191,7 +192,7 @@ fn replay_and_tool_results_round_trip_in_order() {
     let fixture = Fixture::new();
     let mut req = request();
     let mut n = 0;
-    turn(&mut req, &fixture.0, 3, |req| {
+    turn(&mut req, &fixture.0, 3, 4 * 1024 * 1024, |req| {
         n += 1;
         if n == 1 {
             return Ok(response(
@@ -229,10 +230,9 @@ fn incomplete_or_duplicate_calls_never_execute() {
         (vec![], "tool_calls"),
     ] {
         assert!(
-            turn(&mut request(), &fixture.0, 2, |_| Ok(response(
-                calls.clone(),
-                finish
-            )))
+            turn(&mut request(), &fixture.0, 2, 4 * 1024 * 1024, |_| Ok(
+                response(calls.clone(), finish)
+            ))
             .is_err()
         );
         assert!(!fixture.0.root.join("a").exists());
@@ -244,7 +244,7 @@ fn budgets_and_provider_errors_stop_without_retry() {
     let fixture = Fixture::new();
     let mut n = 0;
     assert!(
-        turn(&mut request(), &fixture.0, 1, |_| {
+        turn(&mut request(), &fixture.0, 1, 4 * 1024 * 1024, |_| {
             n += 1;
             Ok(response(vec![call("a", "bad", json!({}))], "tool_calls"))
         })
@@ -255,9 +255,18 @@ fn budgets_and_provider_errors_stop_without_retry() {
     assert_eq!(n, 1);
     let mut req = request();
     req.system = "x".repeat(512 * 1024);
-    assert!(turn(&mut req, &fixture.0, 1, |_| panic!("over budget")).is_err());
+    let size = serde_json::to_vec(&req).unwrap().len();
+    assert!(turn(&mut req, &fixture.0, 1, size - 1, |_| panic!("over budget")).is_err());
+    turn(&mut req, &fixture.0, 1, size, |_| {
+        Ok(response(vec![], "stop"))
+    })
+    .unwrap();
+    turn(&mut req, &fixture.0, 1, 4 * 1024 * 1024, |_| {
+        Ok(response(vec![], "stop"))
+    })
+    .unwrap();
     assert!(
-        turn(&mut request(), &fixture.0, 1, |_| Err(
+        turn(&mut request(), &fixture.0, 1, 4 * 1024 * 1024, |_| Err(
             "network failed".into()
         ))
         .is_err()
@@ -356,7 +365,10 @@ fn real_client_loopback_tool_round_trip() {
         .with_endpoint(endpoint)
         .unwrap();
     let mut req = request();
-    turn(&mut req, &fixture.0, 3, |r| client.run(r, |_| true)).unwrap();
+    turn(&mut req, &fixture.0, 3, 4 * 1024 * 1024, |r| {
+        client.run(r, |_| true)
+    })
+    .unwrap();
     server.join().unwrap();
     assert_eq!(
         fs::read_to_string(fixture.0.root.join("a")).unwrap(),

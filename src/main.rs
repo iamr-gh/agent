@@ -1,4 +1,6 @@
 mod auth;
+mod input;
+mod ui;
 
 use llm_api::{Client, Message, Provider, Request, Response, Result};
 use serde_json::{Value, json};
@@ -27,70 +29,8 @@ fn check_interrupt() -> Result<()> {
     Ok(())
 }
 
-struct StdinFlags(libc::c_int);
-impl Drop for StdinFlags {
-    fn drop(&mut self) {
-        // SAFETY: restore the original flags on the process-owned stdin descriptor.
-        unsafe {
-            libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, self.0);
-        }
-    }
-}
-
-// No stdio prefetch; nonblocking read handles a Ctrl-C flush between poll and read.
-fn input_line() -> Result<String> {
-    // SAFETY: fcntl does not take ownership of stdin.
-    let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    let _restore = StdinFlags(flags);
-    if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    let mut input = Vec::new();
-    loop {
-        check_interrupt()?;
-        let mut fd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: fd is a live stack value; poll borrows it only for this call.
-        let ready = unsafe { libc::poll(&mut fd, 1, 25) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error.into());
-        }
-        if ready == 0 {
-            continue;
-        }
-        let mut byte = [0];
-        // SAFETY: byte is writable for one byte; stdin ownership stays with the process.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
-        if n < 0 {
-            let error = io::Error::last_os_error();
-            if matches!(
-                error.kind(),
-                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-            ) {
-                continue;
-            }
-            return Err(error.into());
-        }
-        if n == 0 {
-            break;
-        }
-        input.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
-    check_interrupt()?;
-    Ok(String::from_utf8(input)?)
+fn input_line(prompt: &str) -> Result<String> {
+    input::read_line(prompt)
 }
 
 fn text(role: &str, value: String) -> Message {
@@ -149,6 +89,7 @@ fn tools() -> Vec<Value> {
 struct Workspace {
     root: PathBuf,
     yes: bool,
+    verbose: bool,
 }
 
 impl Workspace {
@@ -186,19 +127,18 @@ impl Workspace {
     }
 
     fn approve(&self, name: &str, args: &Value) -> Result<()> {
-        eprintln!("\n{} {}", name, display(&args.to_string()));
         if self.yes {
             return check_interrupt();
         }
+        // Approval always exposes the full proposed effect, even in compact mode.
+        eprintln!("\n{} {}", name, display(&args.to_string()));
         if !io::stdin().is_terminal() {
             return Err(
                 "approval requires a terminal; omit --ask or pass --yes to allow automatically"
                     .into(),
             );
         }
-        eprint!("Allow with full user privileges? [y/N] ");
-        io::stderr().flush()?;
-        let answer = input_line()?;
+        let answer = input_line("Allow with full user privileges? [y/N] ")?;
         check_interrupt()?;
         if answer.trim() != "y" {
             return Err("denied by user".into());
@@ -391,14 +331,16 @@ fn turn(
     request: &mut Request,
     workspace: &Workspace,
     max_turns: usize,
+    max_context_bytes: usize,
     mut infer: impl FnMut(&Request) -> Result<Response>,
 ) -> Result<()> {
+    let mut tool_number = 0;
     for _ in 0..max_turns {
         check_interrupt()?;
-        if serde_json::to_vec(request)?.len() > 512 * 1024 {
-            return Err(
-                "context exceeds 512 KiB; start a new conversation (no silent truncation)".into(),
-            );
+        if serde_json::to_vec(request)?.len() > max_context_bytes {
+            return Err(format!(
+                "context exceeds {max_context_bytes} bytes; increase --max-context-kib or start a new conversation (no silent truncation)"
+            ).into());
         }
         let response = infer(request)?;
         check_interrupt()?;
@@ -433,11 +375,31 @@ fn turn(
         let content = calls
             .iter()
             .map(|call| {
+                tool_number += 1;
+                let name = call["name"].as_str().unwrap_or("unknown");
+                if workspace.verbose {
+                    eprintln!(
+                        "[{tool_number}] {} {}",
+                        display(name),
+                        display(&call["arguments"].to_string())
+                    );
+                } else {
+                    eprintln!("[{tool_number}] {}", ui::label(name, &call["arguments"]));
+                }
+                let started = Instant::now();
                 let result = field(call, "name")
                     .and_then(|name| workspace.execute(name, &call["arguments"]));
                 let is_error = result.is_err();
                 let output = result.unwrap_or_else(|e| e.to_string());
-                eprintln!("{}", display(&limited(&output)));
+                if workspace.verbose {
+                    eprintln!("{}", display(&limited(&output)));
+                } else {
+                    eprintln!(
+                        "[{tool_number}] {} · {:.1}s",
+                        ui::outcome(name, &output, is_error),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
                 json!({"type":"tool_result","id":call["id"],"output":output,"is_error":is_error})
             })
             .collect();
@@ -454,19 +416,28 @@ fn run() -> Result<()> {
     let mut provider = std::env::var("AGENT_PROVIDER").unwrap_or("codex".into());
     let mut model = std::env::var("AGENT_MODEL").unwrap_or("gpt-6.1-sol".into());
     let mut yes = true;
-    let mut max_turns = 20;
+    let mut verbose = false;
+    let mut max_turns = 500;
+    let mut max_context_kib: usize = 4096;
     let mut prompt = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--verbose" => verbose = true,
             "--yes" => yes = true,
             "--ask" => yes = false,
             "--provider" => provider = args.next().ok_or("--provider needs a value")?,
             "--model" => model = args.next().ok_or("--model needs a value")?,
             "--max-turns" => max_turns = args.next().ok_or("--max-turns needs a value")?.parse()?,
+            "--max-context-kib" => {
+                max_context_kib = args
+                    .next()
+                    .ok_or("--max-context-kib needs a value")?
+                    .parse()?;
+            }
             "--help" | "-h" => {
                 println!(
-                    "agent [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--max-turns N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nNo prompt: interactive conversation. /quit exits, /clear resets history.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval."
+                    "agent [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits, /clear resets history.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
                 );
                 return Ok(());
             }
@@ -485,6 +456,10 @@ fn run() -> Result<()> {
     if model.is_empty() || max_turns == 0 {
         return Err("set --model/AGENT_MODEL and a positive --max-turns".into());
     }
+    let max_context_bytes = max_context_kib
+        .checked_mul(1024)
+        .filter(|bytes| *bytes > 0)
+        .ok_or("--max-context-kib must be positive and fit in bytes")?;
     let provider: Provider = serde_json::from_value(json!(provider))?;
     let client = match provider {
         Provider::Codex => auth::codex_client()?,
@@ -500,6 +475,7 @@ fn run() -> Result<()> {
     let workspace = Workspace {
         root: std::env::current_dir()?.canonicalize()?,
         yes,
+        verbose,
     };
     let mut request = Request {
         model,
@@ -512,7 +488,12 @@ fn run() -> Result<()> {
         tools: tools(),
         json_schema: None,
         max_tokens: 8192,
-        options: Default::default(),
+        options: if provider == Provider::Codex {
+            // Codex otherwise may return only opaque replay, with no visible summary.
+            serde_json::from_value(json!({"reasoning":{"summary":"auto"}}))?
+        } else {
+            Default::default()
+        },
     };
     let instructions = workspace.root.join("AGENTS.md");
     if instructions.exists() {
@@ -521,7 +502,14 @@ fn run() -> Result<()> {
             workspace.read(&workspace.path("AGENTS.md")?)?
         ));
     }
-    chat(client, workspace, request, prompt, max_turns)
+    chat(
+        client,
+        workspace,
+        request,
+        prompt,
+        max_turns,
+        max_context_bytes,
+    )
 }
 
 fn chat(
@@ -530,6 +518,7 @@ fn chat(
     mut request: Request,
     prompt: Vec<String>,
     max_turns: usize,
+    max_context_bytes: usize,
 ) -> Result<()> {
     let interactive = prompt.is_empty();
     if interactive && !io::stdin().is_terminal() {
@@ -537,9 +526,8 @@ fn chat(
     }
     loop {
         let input = if interactive {
-            eprint!("\n> ");
-            io::stderr().flush()?;
-            let input = match input_line() {
+            eprintln!();
+            let input = match input_line("> ") {
                 Ok(input) => input,
                 Err(e) if e.is::<llm_api::Cancelled>() => {
                     INTERRUPTED.store(false, Ordering::Relaxed);
@@ -564,20 +552,30 @@ fn chat(
             prompt.join(" ")
         };
         request.messages.push(text("user", input));
-        let result = turn(&mut request, &workspace, max_turns, |req| {
-            let result = client.run_cancellable(req, &INTERRUPTED, |event| {
-                if check_interrupt().is_err() {
-                    return false;
-                }
-                if event["type"] == "text_delta" {
-                    print!("{}", display(event["delta"].as_str().unwrap_or("")));
-                    return io::stdout().flush().is_ok();
-                }
-                true
-            });
-            println!();
-            result
-        });
+        let result = turn(
+            &mut request,
+            &workspace,
+            max_turns,
+            max_context_bytes,
+            |req| {
+                let styled = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+                let mut stream = ui::StreamDisplay::new(styled);
+                let result = client.run_cancellable(req, &INTERRUPTED, |event| {
+                    if check_interrupt().is_err() {
+                        return false;
+                    }
+                    let chunk = stream.delta(&event);
+                    if !chunk.is_empty() {
+                        print!("{chunk}");
+                        return io::stdout().flush().is_ok();
+                    }
+                    true
+                });
+                print!("{}", stream.finish());
+                io::stdout().flush()?;
+                result
+            },
+        );
         if interactive && INTERRUPTED.swap(false, Ordering::Relaxed) {
             request.messages.push(text("user", "Previous turn cancelled. Completed tool effects may remain; inspect state before retrying anything.".into()));
             eprintln!("cancelled; completed changes were not rolled back");

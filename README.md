@@ -58,16 +58,20 @@ A fully independent browser/device OAuth login and refresh flow belongs in this 
 - `write_file`: create or replace a file; existing parent required. Atomic sibling-file replacement preserves existing permissions, not hard-link identity, extended attributes, or inode metadata. New files are private (`0600`).
 - `shell`: `/bin/sh -c` in the startup working directory. Results include exit status, stdout, and stderr.
 
-**All valid tool calls are allowed without confirmation by default**, including arbitrary shell execution with your full user privileges. Writes and shell commands still show their full arguments. Pass `--ask` to require literal `y` for writes and shell commands (noninteractive use then denies them); `--yes` restores automatic approval. Reads are automatic in either mode. Unknown tools/fields and incorrect argument types are rejected locally.
+**All valid tool calls are allowed without confirmation by default**, including arbitrary shell execution with your full user privileges. Tool activity uses compact summaries by default; pass `--verbose` to show full arguments and bounded results. Approval prompts always show full arguments. Pass `--ask` to require literal `y` for writes and shell commands (noninteractive use then denies them); `--yes` restores automatic approval. Reads are automatic in either mode. Unknown tools/fields and incorrect argument types are rejected locally.
 
 File tools reject resolved paths outside the startup directory. These checks and approvals are **not a sandbox**: concurrent symlink/directory swaps can race checks, reads can expose workspace secrets, and approved shell commands have unrestricted host access. Use trusted projects or external OS isolation. Root `AGENTS.md` is loaded automatically; the model is instructed to read applicable nested guides, but that is not mechanically enforced.
 
+### Reasoning display
+
+Visible reasoning streams live under a `Thinking:` label, dim and italic in a terminal, followed by the normal answer. Redirected output is plain text; `NO_COLOR` disables styling. Codex requests automatic reasoning summaries. Other providers display reasoning when emitted, but thinking is not enabled automatically for every model. Only provider-exposed text/summaries are shown, never encrypted replay or signatures. This is independent of `--verbose`.
+
 ### Bounds and failure behavior
 
-- Default 20 model calls per user prompt (`--max-turns N`); at most 32 tools per response.
+- Default 500 model calls per user prompt (`--max-turns N`); at most 32 tools per response. Per-response output budget remains 8,192 tokens.
 - Files/writes: 1 MiB; each file result and each shell output stream: 32 KiB. Oversized output is marked, not silently accepted as complete.
 - Shell deadline: 60 seconds; subprocess stdin is closed. Process-group cleanup also runs after normal shell completion. Detached jobs can escape cleanup, but cannot keep the output collector waiting indefinitely.
-- Context: 512 KiB serialized request guard, **not a model-specific token counter**. Full history and opaque replay are kept until `/clear` or exit; nothing is silently compacted.
+- Context: 4 MiB serialized request guard (`--max-context-kib N`, default 4096), **not a model-specific token counter**. Provider/model context limits still apply. Full history and opaque replay are kept until `/clear` or exit; nothing is silently compacted. For larger local budgets, use e.g. `cargo run --release -- --max-turns 200 --max-context-kib 8192`.
 - Only finalized `tool_calls` responses execute tools. Incomplete responses, malformed IDs, provider errors, context exhaustion, and turn exhaustion stop with exit 1. Tool failures become matching results for the model; there are no automatic side-effect retries.
 - Ctrl-C cancels the current interactive turn and returns to the prompt, including while waiting for input or approval. During a model request it uses `llm-api::Client::run_cancellable` to close idle sockets without waiting for another event. Shell process-group cleanup runs before continuing. Batch cancellation exits 130. DNS/connect stages may still take up to five seconds each; callbacks and file writes are not forcibly preempted. This is not yet a nonblocking TUI or a prompt-revision interface.
 - Cancellation is not rollback: completed changes remain. Partial model output is not appended as an assistant response; advertised tool calls retain matching results, including interrupted/unstarted calls. History gains an interruption note, and later turns are told to inspect state before retrying effects. Context is retained unless you use `/clear`.
