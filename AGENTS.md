@@ -2,6 +2,10 @@
 
 Keep changes small, preserve unrelated work, and inspect applicable instructions before editing.
 
+## Documentation
+
+The root `README.md` is human-written and human-maintained. Do not edit it or update it with each change. Structural or architectural updates may be documented in `docs/` instead.
+
 ## Verify and install
 
 After code changes, run from the repository root:
