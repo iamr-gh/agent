@@ -29,6 +29,8 @@ export OPENAI_API_KEY='...'
 
 Run the binary **from the directory you want it to work in**. Options precede the prompt. No prompt starts a line-oriented conversation; `/clear` resets history and `/quit` exits. Use `--` before a prompt beginning with `-`.
 
+Input wraps across terminal rows, with explicit redraw so Backspace can erase across line boundaries. Input taller than the screen shows its trailing rows. Backspace removes a Unicode grapheme; Ctrl-W erases a word and Ctrl-U clears the input. Enter submits; Ctrl-D on empty input exits. Input history and cursor navigation are not implemented.
+
 The defaults are provider `codex` and model `gpt-6.1-sol`. `AGENT_PROVIDER` and `AGENT_MODEL` override these defaults; the corresponding command-line flags take precedence. Keys are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`. The CLI does not load `.env`.
 
 ### One-command Codex launch
