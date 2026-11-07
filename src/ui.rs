@@ -1,6 +1,7 @@
 //! Terminal frontend. Escaping, styling, prompts and input stay out of the engine.
 mod cli;
 mod input;
+mod picker;
 use crate::engine::{Frontend, check_interrupt, limited};
 #[cfg(test)]
 pub(crate) use cli::chat;

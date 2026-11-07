@@ -47,7 +47,7 @@ pub(crate) fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "agent [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/resume lists saved sessions; /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
+                    "agent [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/resume opens a searchable session picker (↑/↓, Enter, Esc); /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
                 );
                 return Ok(());
             }
@@ -229,13 +229,6 @@ fn chat_session(
                     }
                     continue;
                 }
-                "/resume" => {
-                    for entry in Store::list(&session::directory()?, &workspace.root)? {
-                        eprintln!("{}", super::display(&entry));
-                    }
-                    eprintln!("Use /resume <id> to restore a session.");
-                    continue;
-                }
                 "/reload" => {
                     session.save(false)?;
                     if let Some(store) = &session.store {
@@ -263,9 +256,34 @@ fn chat_session(
                     }
                     continue;
                 }
-                command if command.starts_with("/resume ") => {
-                    let id = command.trim_start_matches("/resume ").trim();
-                    match Store::load(&session::directory()?, &workspace.root, id)
+                command if command == "/resume" || command.starts_with("/resume ") => {
+                    let root = session::directory()?;
+                    let current = session.store.as_ref().map(|store| store.id.as_str());
+                    let selected = if command == "/resume" {
+                        Store::list(&root, &workspace.root)
+                            .and_then(|entries| super::picker::choose(&entries, current))
+                    } else {
+                        Ok(Some(
+                            command.trim_start_matches("/resume ").trim().to_owned(),
+                        ))
+                    };
+                    let id = match selected {
+                        Ok(Some(id)) => id,
+                        Ok(None) => continue,
+                        Err(e) if e.is::<llm_api::Cancelled>() => {
+                            INTERRUPTED.store(false, Ordering::Relaxed);
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("resume failed: {}", super::display(&error.to_string()));
+                            continue;
+                        }
+                    };
+                    if current == Some(id.as_str()) {
+                        preview(&session);
+                        continue;
+                    }
+                    match Store::load(&root, &workspace.root, &id)
                         .and_then(|(saved, provider)| Ok((saved, provider, connect(provider)?)))
                     {
                         Ok((saved, saved_provider, saved_client)) => {

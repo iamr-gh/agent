@@ -22,6 +22,21 @@ impl Drop for Terminal {
     }
 }
 impl Terminal {
+    /// Wait briefly for a byte, allowing callers to check cancellation and resize.
+    pub(super) fn read_byte(&self) -> io::Result<Option<u8>> {
+        let fd = self.input.as_raw_fd();
+        if !wait_for_input(fd)? {
+            return Ok(None);
+        }
+        let mut byte = 0;
+        // SAFETY: read borrows an owned descriptor and a one-byte buffer.
+        match unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) } {
+            0 => Ok(Some(4)), // Treat terminal EOF like Ctrl-D.
+            1 => Ok(Some(byte)),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
     pub(super) fn enter() -> io::Result<Self> {
         // A separate open description avoids making stdout/stderr nonblocking
         // when a PTY launcher gave all three streams the same underlying handle.
@@ -51,7 +66,7 @@ impl Terminal {
     }
 }
 
-fn dimensions() -> (usize, usize) {
+pub(super) fn dimensions() -> (usize, usize) {
     // SAFETY: ioctl initializes size on success; stderr is only borrowed.
     unsafe {
         let mut size: libc::winsize = std::mem::zeroed();

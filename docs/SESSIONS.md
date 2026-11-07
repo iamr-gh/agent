@@ -2,7 +2,7 @@
 
 Sessions are saved automatically under `$AGENT_HOME/sessions` (default `~/.agent/sessions`).
 
-- `/resume` lists sessions for the current canonical workspace, newest first.
+- `/resume` opens a quick switcher for the current canonical workspace, most recently updated first. Type to filter by the first prompt, model, or ID; use ↑/↓ to browse, Enter to resume, and Esc or Ctrl-C to cancel. Entries show the first prompt, model, relative update time, and a `(current)` marker. Choosing the current session is a no-op.
 - `/resume ID` restores one and shows recent text. `agent --resume ID` does the same at launch.
 - `/reload` saves and execs the executable at its startup path with `--resume ID`. Build a new executable first to load new code. This preserves the PID, current permission mode, verbosity, and budgets; it does not build automatically.
 - `/clear` starts a new saved session without deleting the old one.

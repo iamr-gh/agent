@@ -13,6 +13,13 @@ pub(crate) struct Session {
     pub store: Option<Store>,
 }
 
+pub(crate) struct Summary {
+    pub id: String,
+    pub title: String,
+    pub model: String,
+    pub modified: SystemTime,
+}
+
 pub(crate) struct Store {
     pub id: String,
     root: PathBuf,
@@ -136,7 +143,7 @@ impl Store {
         ))
     }
 
-    pub fn list(root: &Path, workspace: &Path) -> Result<Vec<String>> {
+    pub fn list(root: &Path, workspace: &Path) -> Result<Vec<Summary>> {
         let mut sessions = Vec::new();
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
@@ -153,14 +160,17 @@ impl Store {
                 .and_then(|messages| messages.iter().find(|m| m["role"] == "user"))
                 .and_then(|m| m["content"][0]["text"].as_str())
                 .unwrap_or("(empty)");
-            sessions.push(format!(
-                "{}  {}",
-                path.file_stem().unwrap().to_string_lossy(),
-                title.chars().take(80).collect::<String>()
-            ));
+            sessions.push(Summary {
+                id: path.file_stem().unwrap().to_string_lossy().into_owned(),
+                title: title.chars().take(240).collect(),
+                model: data["request"]["model"]
+                    .as_str()
+                    .unwrap_or("unknown model")
+                    .into(),
+                modified: fs::metadata(&path)?.modified()?,
+            });
         }
-        sessions.sort();
-        sessions.reverse();
+        sessions.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.id.cmp(&a.id)));
         Ok(sessions)
     }
 }
@@ -224,6 +234,32 @@ mod tests {
         assert_eq!(serde_json::to_value(&loaded.request).unwrap(), expected);
         assert_eq!(Store::list(&root, &f.0.root).unwrap().len(), 1);
         assert!(Store::list(&root, &root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn summaries_show_prompt_and_model_in_last_modified_order() {
+        let f = Fixture::new();
+        let root = root(&f);
+        let mut req = request();
+        req.messages = vec![text("user", "Fix the parser".into())];
+        let first = Store::create(&root, &f.0.root, Provider::Openai, &req).unwrap();
+        req.messages = vec![text("user", "Add tests".into())];
+        let second = Store::create(&root, &f.0.root, Provider::Openai, &req).unwrap();
+        // An older-created chat with newer activity belongs first.
+        File::options()
+            .write(true)
+            .open(root.join(format!("{}.json", second.id)))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+        let entries = Store::list(&root, &f.0.root).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, first.id);
+        assert_eq!(entries[0].title, "Fix the parser");
+        assert_eq!(entries[0].model, req.model);
+        assert_eq!(entries[1].id, second.id);
+        assert_eq!(entries[1].title, "Add tests");
+        assert_eq!(entries[1].modified, UNIX_EPOCH);
     }
 
     #[test]

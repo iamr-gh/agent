@@ -97,7 +97,39 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
         assert locked.returncode == 1 and b"already open" in locked.stderr
         terminal.command("/clear")
         assert len(list(sessions.glob("*.json"))) == 2
-        assert b"Use /resume <id>" in terminal.command("/resume")
+        # Search without IDs; no match, Enter, Escape, and Ctrl-C are safe.
+        terminal.send("/resume")
+        terminal.expect(b"Resume > ")
+        terminal.expect(b"Esc cancel")
+        os.write(terminal.master, b"no such session")
+        terminal.expect(b"No matching sessions")
+        os.write(terminal.master, b"\r\x15saved")
+        terminal.expect(b"saved question")
+        os.write(terminal.master, b"\x1b")
+        terminal.expect(b"\r\x1b[J> ")
+        assert json.loads(path.read_text()) == saved
+        terminal.send("/resume")
+        terminal.expect(b"Esc cancel")
+        os.write(terminal.master, b"\x03")
+        terminal.expect(b"\r\x1b[J> ")
+        # A locked selection reports the failure without losing this session.
+        other = Terminal(binary, workspace, env, "--resume", path.stem)
+        try:
+            terminal.send("/resume")
+            terminal.expect(b"Esc cancel")
+            os.write(terminal.master, b"saved\r")
+            terminal.expect(b"already open")
+            terminal.expect(b"\r\x1b[J> ")
+        finally:
+            other.close()
+        # The chat just opened by the other process is now most recent.
+        # Browse down and back up before selecting it without an ID.
+        terminal.send("/resume")
+        terminal.expect(b"(current)")
+        terminal.expect(b"Esc cancel")
+        os.write(terminal.master, b"\x1b[B\x1b[A\r")
+        terminal.expect(b"saved answer")
+        terminal.expect(b"\r\x1b[J> ")
         assert b"saved answer" in terminal.command("/resume " + path.stem)
         # A failed exec must return to the prompt without losing the writer lock.
         parked = root / "parked"
