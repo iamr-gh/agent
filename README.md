@@ -1,15 +1,12 @@
 # Agent
 
-Basic coding agent, for me, by me. Distills core concepts found in other projects.
+This is a basic coding agent, for me, by me. The goal is to have minimal dependencies, and only implement my most used features of other coding agents. The code in this repo is small enough you can comfortably read all of it.
 
-Meant to have minimal dependencies, small codebase readable by one person. Starting from basic loop, will add a minimal set of high leverage features.
 
-UI will have forgivable complexity as needed to make it nice. UX should always feel instantaneous, and never block user interaction.
-
-Currently, high leverage features could be:
+Feature Roadmap to add:
 - good subagent use/orchestration
 - better support of prompt edits/revisions/forking
 - swarm support (agent-agent comms)
 - self-scaffolding/RLM esque features
 - seamless syncing to cloud agent and back
-- smarter permissions management and sandboxing of sensitive assets
+- smarter permissions management and sandboxing
