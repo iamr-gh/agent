@@ -62,6 +62,25 @@ A fully independent browser/device OAuth login and refresh flow belongs in this 
 
 File tools reject resolved paths outside the startup directory. These checks and approvals are **not a sandbox**: concurrent symlink/directory swaps can race checks, reads can expose workspace secrets, and approved shell commands have unrestricted host access. Use trusted projects or external OS isolation. Root `AGENTS.md` is loaded automatically; the model is instructed to read applicable nested guides, but that is not mechanically enforced.
 
+### Skills
+
+Skills are directories containing a `SKILL.md` with `---` frontmatter, a `name`, and a `description`, followed by Markdown instructions. No installation command or fx dependency is required: place or symlink a skill directory into a supported root.
+
+Discovery order (later roots override earlier skills with the same name):
+
+1. `~/.agents/skills` (shared with fx and other agents)
+2. `$AGENT_HOME/skills`, or `~/.agent/skills` by default
+3. `.agents/skills` in the startup workspace
+4. `.agent/skills` in the startup workspace
+
+Only immediate child directories are scanned; symlinked skills work. Frontmatter supports plain/quoted name and description strings and indented `>`/`|` description blocks, not full YAML. Invalid/unreadable skills are skipped with diagnostics. Names use up to 64 ASCII letters, digits, hyphens, or underscores; descriptions are limited to 2048 bytes.
+
+`agent --list-skills` prints the discovered catalog without credentials or a model request. Startup adds only metadata to the model context. The model is instructed to call the read-only `load_skill` tool when a task matches a description or you name a skill (for example, “use the rex skill to inspect my Rex tabs”). Instructions are loaded on demand, with a 32 KiB result limit; no skill commands execute automatically. Restart to refresh catalog metadata after installing skills.
+
+The existing shared Rex installation at `~/.agents/skills/rex/SKILL.md` is supported directly. Its instructions obtain the current guide from the installed `rex` CLI rather than embedding a stale command reference. Rex must be on PATH and running/connected as required by that CLI.
+
+Skill reads may be outside the workspace, but only through exact discovered names; ordinary file tools remain workspace-restricted. Relative references are based on the skill directory and external references use `shell`. Skills and their referenced scripts must be trusted; commands still use normal `--ask`/`--yes` rules and run with full user privileges. Skill text cannot override user requests or agent rules.
+
 ### Reasoning display
 
 Visible reasoning streams live under a `Thinking:` label, dim and italic in a terminal, followed by the normal answer. Redirected output is plain text; `NO_COLOR` disables styling. Codex requests automatic reasoning summaries. Other providers display reasoning when emitted, but thinking is not enabled automatically for every model. Only provider-exposed text/summaries are shown, never encrypted replay or signatures. This is independent of `--verbose`.

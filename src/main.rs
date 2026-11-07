@@ -1,5 +1,6 @@
 mod auth;
 mod input;
+mod skills;
 mod ui;
 
 use llm_api::{Client, Message, Provider, Request, Response, Result};
@@ -75,6 +76,7 @@ fn field<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 
 fn tools() -> Vec<Value> {
     [
+        ("load_skill", "Load an installed skill's instructions by exact catalog name. Read-only; includes its directory for relative references.", vec!["name"], json!({"name":{"type":"string"}})),
         ("read_file", "Read UTF-8 text, at most 32 KiB per result. Optional 1-based start_line and line_count (default 200).", vec!["path"], json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1}})),
         ("write_file", "Create or overwrite a UTF-8 file after approval; parent must exist.", vec!["path","content"], json!({"path":{"type":"string"},"content":{"type":"string"}})),
         ("edit_file", "Replace exactly one occurrence of old_string with new_string after approval.", vec!["path","old_string","new_string"], json!({"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}})),
@@ -164,6 +166,9 @@ impl Workspace {
         }
         for key in schema["parameters"]["required"].as_array().unwrap() {
             field(args, key.as_str().unwrap())?;
+        }
+        if name == "load_skill" {
+            return skills::load(self, field(args, "name")?);
         }
         if name == "shell" {
             self.approve(name, args)?;
@@ -423,6 +428,15 @@ fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--list-skills" => {
+                let workspace = Workspace {
+                    root: std::env::current_dir()?.canonicalize()?,
+                    yes: false,
+                    verbose: false,
+                };
+                println!("{}", skills::catalog(&skills::discover(&workspace)));
+                return Ok(());
+            }
             "--verbose" => verbose = true,
             "--yes" => yes = true,
             "--ask" => yes = false,
@@ -437,7 +451,7 @@ fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "agent [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits, /clear resets history.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
+                    "agent [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits, /clear resets history.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
                 );
                 return Ok(());
             }
@@ -495,6 +509,9 @@ fn run() -> Result<()> {
             Default::default()
         },
     };
+    request
+        .system
+        .push_str(&skills::catalog(&skills::discover(&workspace)));
     let instructions = workspace.root.join("AGENTS.md");
     if instructions.exists() {
         request.system.push_str(&format!(

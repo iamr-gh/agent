@@ -1,9 +1,9 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-struct Fixture(Workspace);
+pub(crate) struct Fixture(pub(crate) Workspace);
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "agent-test-{}-{}",
