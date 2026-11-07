@@ -1,6 +1,6 @@
 //! A small wrapped input editor. Redraw all visible rows explicitly so erase
 //! works across line boundaries without relying on canonical terminal editing.
-use super::{Result, check_interrupt, ui};
+use crate::{Result, check_interrupt, ui};
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;

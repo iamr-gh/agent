@@ -21,7 +21,7 @@ fn process_helper() {
     let workspace = Workspace {
         root: PathBuf::from(std::env::var_os("AGENT_CANCEL_WORKSPACE").unwrap()),
         yes: std::env::var("AGENT_CANCEL_APPROVAL").as_deref() != Ok("1"),
-        verbose: false,
+        frontend: Box::new(crate::ui::TerminalFrontend { verbose: false }),
     };
     let prompt = if std::env::var("AGENT_CANCEL_BATCH").as_deref() == Ok("1") {
         vec!["task".into()]

@@ -1,4 +1,5 @@
-use crate::{OUTPUT_LIMIT, Result, Workspace};
+use crate::engine::{OUTPUT_LIMIT, Workspace};
+use llm_api::Result;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,10 +101,9 @@ fn discover_in(workspace: &Workspace, roots: &[PathBuf]) -> Vec<Skill> {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                eprintln!(
-                    "skills: {}",
-                    crate::display(&format!("{}: {e}", root.display()))
-                );
+                workspace
+                    .frontend
+                    .diagnostic(&format!("{}: {e}", root.display()));
                 continue;
             }
         };
@@ -130,10 +130,9 @@ fn discover_in(workspace: &Workspace, roots: &[PathBuf]) -> Vec<Skill> {
                 Ok(skill) => {
                     skills.insert(skill.name.clone(), skill);
                 }
-                Err(e) => eprintln!(
-                    "skills: {}",
-                    crate::display(&format!("{}: {e}", path.display()))
-                ),
+                Err(e) => workspace
+                    .frontend
+                    .diagnostic(&format!("{}: {e}", path.display())),
             }
         }
     }

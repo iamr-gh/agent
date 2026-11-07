@@ -1,3 +1,5 @@
+mod frontend;
+
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +16,7 @@ impl Fixture {
         Self(Workspace {
             root: root.canonicalize().unwrap(),
             yes: true,
-            verbose: false,
+            frontend: Box::new(frontend::Recorder::default()),
         })
     }
 }
@@ -381,6 +383,7 @@ fn real_client_loopback_tool_round_trip() {
 fn noninteractive_approval_fails_closed() {
     if !io::stdin().is_terminal() {
         let mut fixture = Fixture::new();
+        fixture.0.frontend = Box::new(crate::ui::TerminalFrontend { verbose: false });
         fixture.0.yes = false;
         assert!(
             fixture

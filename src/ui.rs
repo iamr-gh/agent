@@ -1,7 +1,88 @@
-//! Terminal-only summaries. Never shorten the tool results sent to the model.
-use super::display;
+//! Terminal frontend. Escaping, styling, prompts and input stay out of the engine.
+mod cli;
+mod input;
+use crate::engine::{Frontend, check_interrupt, limited};
+#[cfg(test)]
+pub(crate) use cli::chat;
+pub(crate) use cli::run;
+use llm_api::Result;
 use serde_json::Value;
 use std::io::{self, IsTerminal};
+use std::time::Duration;
+
+// Escape terminal control sequences from models, files, and commands, including OSC/CSI.
+pub(crate) fn display(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+pub(crate) struct TerminalFrontend {
+    pub(crate) verbose: bool,
+}
+
+impl Frontend for TerminalFrontend {
+    fn approve(&self, name: &str, args: &Value) -> Result<()> {
+        // Approval always exposes the full proposed effect, even in compact mode.
+        eprintln!("\n{} {}", display(name), display(&args.to_string()));
+        if !io::stdin().is_terminal() {
+            return Err(
+                "approval requires a terminal; omit --ask or pass --yes to allow automatically"
+                    .into(),
+            );
+        }
+        let answer = input::read_line("Allow with full user privileges? [y/N] ")?;
+        check_interrupt()?;
+        if answer.trim() != "y" {
+            return Err("denied by user".into());
+        }
+        Ok(())
+    }
+
+    fn tool_started(&self, number: usize, name: &str, args: &Value) {
+        let label = if self.verbose {
+            format!(
+                "[{number}] {} {}",
+                display(name),
+                display(&args.to_string())
+            )
+        } else {
+            format!("[{number}] {}", label(name, args))
+        };
+        tool_activity(&label);
+    }
+
+    fn tool_finished(
+        &self,
+        number: usize,
+        name: &str,
+        output: &str,
+        is_error: bool,
+        elapsed: Duration,
+    ) {
+        let summary = if self.verbose {
+            display(&limited(output))
+        } else {
+            format!(
+                "[{number}] {} · {:.1}s",
+                outcome(name, output, is_error),
+                elapsed.as_secs_f64()
+            )
+        };
+        tool_activity(&summary);
+    }
+
+    fn diagnostic(&self, message: &str) {
+        eprintln!("skills: {}", display(message));
+    }
+}
 
 pub fn styles_enabled(terminal: bool) -> bool {
     terminal && std::env::var_os("NO_COLOR").is_none()
