@@ -200,11 +200,12 @@ pub fn outcome(name: &str, output: &str, is_error: bool) -> String {
     }
 }
 
-/// Small streaming renderer: keep reasoning distinct without buffering it.
-/// Style each chunk separately so cancellation/errors cannot leave styles active.
+/// Stream reasoning and plain output; buffer terminal answers for Markdown parsing.
+/// Flush buffered text even on cancellation/errors, without changing the transcript.
 pub struct StreamDisplay {
     styled: bool,
     reasoning: Option<bool>,
+    answer: String,
 }
 
 impl StreamDisplay {
@@ -212,6 +213,7 @@ impl StreamDisplay {
         Self {
             styled,
             reasoning: None,
+            answer: String::new(),
         }
     }
 
@@ -225,7 +227,11 @@ impl StreamDisplay {
         if text.is_empty() {
             return String::new();
         }
-        let mut out = String::new();
+        if self.styled && !reasoning {
+            self.answer.push_str(text);
+            return String::new();
+        }
+        let mut out = self.flush_answer();
         if self.reasoning != Some(reasoning) {
             if self.reasoning.is_some() {
                 out.push_str("\n\n");
@@ -236,24 +242,38 @@ impl StreamDisplay {
             }
         }
         self.reasoning = Some(reasoning);
-        out.push_str(&display(text));
-        styled(
-            &out,
+        out.push_str(&styled(
+            &display(text),
             if reasoning {
                 Style::Reasoning
             } else {
                 Style::Answer
             },
             self.styled,
-        )
+        ));
+        out
     }
 
-    pub fn finish(&mut self) -> &'static str {
-        if self.reasoning.take().is_some() {
-            "\n"
+    fn flush_answer(&mut self) -> String {
+        if self.answer.is_empty() {
+            return String::new();
+        }
+        let prefix = if self.reasoning == Some(true) {
+            "\n\n"
         } else {
             ""
+        };
+        let safe = display(&std::mem::take(&mut self.answer));
+        self.reasoning = Some(false);
+        format!("{prefix}{}", termimad::term_text(&safe))
+    }
+
+    pub fn finish(&mut self) -> String {
+        let mut out = self.flush_answer();
+        if self.reasoning.take().is_some() && !out.ends_with('\n') {
+            out.push('\n');
         }
+        out
     }
 }
 
@@ -317,12 +337,49 @@ mod tests {
         assert_eq!(stream.finish(), "\n");
         assert_eq!(
             stream.delta(&json!({"type":"text_delta","delta":"Normal"})),
-            "\x1b[0;39mNormal\x1b[0m"
+            ""
         );
+        let chunk = stream.delta(&json!({"type":"reasoning_delta","delta":"Again"}));
+        assert!(chunk.contains("Normal"));
+        assert!(chunk.ends_with("\n\n\x1b[0;3;35mAgain\x1b[0m"));
+    }
+
+    #[test]
+    fn terminal_answers_render_markdown_across_chunks_and_finish_once() {
+        let mut stream = StreamDisplay::new(true);
+        let markdown = "*italic* **bold**\n\n| A | B |\n|---|---|\n| one | two |\n\n```rust\nlet x = 1;\n```\n";
+        for part in markdown.chars() {
+            assert_eq!(
+                stream.delta(&json!({"type":"text_delta","delta":part.to_string()})),
+                ""
+            );
+        }
+        let rendered = stream.finish();
+        for text in ["italic", "bold", "one", "two", "let x = 1;"] {
+            assert!(rendered.contains(text), "missing {text}: {rendered:?}");
+        }
+        assert!(!rendered.contains("**bold**"));
+        assert!(!rendered.contains("```"));
+        assert!(rendered.contains('\x1b'));
+        assert_eq!(stream.finish(), "");
+    }
+
+    #[test]
+    fn buffered_answers_escape_controls_and_preserve_plain_markdown() {
+        let raw = "**bold**\u{1b}[31m\r";
+        let mut plain = StreamDisplay::new(false);
         assert_eq!(
-            stream.delta(&json!({"type":"reasoning_delta","delta":"Again"})),
-            "\x1b[0;3;35m\n\nAgain\x1b[0m"
+            plain.delta(&json!({"type":"text_delta","delta":raw})),
+            display(raw)
         );
+        let mut terminal = StreamDisplay::new(true);
+        terminal.delta(&json!({"type":"reasoning_delta","delta":"Thinking"}));
+        terminal.delta(&json!({"type":"text_delta","delta":raw}));
+        let rendered = terminal.finish();
+        assert!(rendered.starts_with("\n\n"));
+        assert!(rendered.contains("\\u{1b}[31m\\r"));
+        assert!(!rendered.contains("\u{1b}[31m"));
+        assert_eq!(terminal.finish(), "");
     }
 
     #[test]
