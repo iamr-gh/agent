@@ -3,7 +3,7 @@
 use crate::{Result, check_interrupt, ui};
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -108,6 +108,41 @@ fn redraw(
     out.flush()
 }
 
+fn wait_for_input(fd: RawFd) -> io::Result<bool> {
+    if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "terminal descriptor exceeds select capacity",
+        ));
+    }
+    // macOS poll(/dev/tty) returns POLLNVAL immediately, even for a valid
+    // controlling terminal. Reading after that returns EAGAIN and spins.
+    // select supports this device and actually sleeps until input is ready.
+    // Keep a bounded timeout for cancellation checks and terminal resizing.
+    // SAFETY: the descriptor fits fd_set; select borrows initialized stack values.
+    unsafe {
+        let mut read_fds = std::mem::zeroed();
+        libc::FD_ZERO(&mut read_fds);
+        libc::FD_SET(fd, &mut read_fds);
+        let mut timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 25_000,
+        };
+        let ready = libc::select(
+            fd + 1,
+            &mut read_fds,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut timeout,
+        );
+        if ready < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ready > 0)
+        }
+    }
+}
+
 pub fn read_line(prompt: &str) -> Result<String> {
     check_interrupt()?;
     let restore = Terminal::enter()?;
@@ -133,24 +168,14 @@ pub fn read_line(prompt: &str) -> Result<String> {
             last_size = size;
             painted = std::time::Instant::now();
         }
-        let mut fd = libc::pollfd {
-            fd: input_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll borrows a valid stack value; read borrows a one-byte buffer.
-        let ready = unsafe { libc::poll(&mut fd, 1, 25) };
-        if ready < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e.into());
-        }
-        if ready == 0 {
-            continue;
+        match wait_for_input(input_fd) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
         }
         let mut byte = 0u8;
+        // SAFETY: read borrows a live descriptor and a one-byte buffer.
         let n = unsafe { libc::read(input_fd, (&mut byte as *mut u8).cast(), 1) };
         if n < 0 {
             let e = io::Error::last_os_error();
@@ -224,6 +249,100 @@ pub fn read_line(prompt: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_controlling_terminal_waits_without_spinning() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        const HELPER: &str = "AGENT_IDLE_TERMINAL_TEST";
+        if std::env::var_os(HELPER).is_some() {
+            let terminal = Terminal::enter().unwrap();
+            // SAFETY: getrusage initializes the supplied stack values.
+            let cpu_time = || unsafe {
+                let mut usage = std::mem::zeroed();
+                assert_eq!(libc::getrusage(libc::RUSAGE_SELF, &mut usage), 0);
+                let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
+                seconds(usage.ru_utime) + seconds(usage.ru_stime)
+            };
+            let cpu = cpu_time();
+            let start = Instant::now();
+            for _ in 0..10 {
+                assert!(!wait_for_input(terminal.input.as_raw_fd()).unwrap());
+            }
+            assert!(start.elapsed() >= Duration::from_millis(200));
+            assert!(
+                cpu_time() - cpu < 0.1,
+                "idle terminal consumed excessive CPU"
+            );
+            return;
+        }
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty initializes the two descriptors on success.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        // SAFETY: successful openpty transfers ownership of unique descriptors.
+        let master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        // Do not let the child inherit its own terminal master.
+        // SAFETY: master is live and its existing descriptor flags are preserved.
+        unsafe {
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFD);
+            assert!(flags >= 0);
+            assert_eq!(
+                libc::fcntl(master.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC),
+                0
+            );
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "ui::input::tests::idle_controlling_terminal_waits_without_spinning",
+                "--nocapture",
+            ])
+            .env(HELPER, "1")
+            .stdin(slave);
+        // SAFETY: only async-signal-safe syscalls execute between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn wait_rejects_descriptors_outside_fd_set() {
+        for fd in [-1, libc::FD_SETSIZE as RawFd] {
+            assert_eq!(
+                wait_for_input(fd).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
     #[test]
     fn wraps_prompt_and_input_without_splitting_graphemes() {
         assert_eq!(wrapped_rows("> abcdef", 5), ["> abc", "def"]);
