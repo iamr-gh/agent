@@ -1,53 +1,71 @@
-# Design notes
+# Design
 
-The starting reference is the local [harness taxonomy](../../harness_test/TAXONOMY.md) and all six [reviews](../../harness_test/reviews/): core harnesses; first-party agents; orchestrators; Jcode/OpenClaw/RVM/pi; commercial products; evidence audit. These are static architectural evidence, not performance rankings. In particular, unavailable commercial internals and RVM's registry lifecycle are not treated as implementations of a coding loop.
+This document describes the current application. See [saved sessions](SESSIONS.md) for persistence and recovery, and [verification](LIVE_TESTS.md) for checks and test limitations.
 
-The implementation is original code, not copied source. Useful source comparisons from the pinned local snapshots:
+## Responsibilities
 
-- [pi's agent loop](../../harness_test/sources/pi/packages/agent/src/agent-loop.ts): keep conversation state distinct from individual requests; execute finalized calls and pair results with IDs.
-- [OpenClaw's loop](../../harness_test/sources/openclaw/packages/agent-core/src/agent-loop.ts): every executed or failed tool must settle to a result. Its orchestration, recovery, steering, and plugin machinery are deliberately not reproduced.
-- [`llm-api` request and response types](../../llm-api/src/lib.rs) and [protocol tests](../../llm-api/tests/protocols.rs): preserve `response.message` intact, including opaque reasoning replay; never execute argument deltas or truncated responses.
+`agent` is a Unix terminal application with a sequential conversation/tool loop. The `llm-api` dependency handles provider requests, streaming events, native message replay, and network cancellation. The application owns prompts, credentials, tools, approvals, workspace effects, sessions, and terminal presentation.
 
-The reviews' broader lessons are reflected in the boundary choices: the first-party products separate instructions from authority, Aider demonstrates that editing is its own correctness problem, orchestrators solve a larger lifecycle problem, and the commercial review explicitly limits what can be concluded from public evidence. A small line count is a readability constraint, not evidence of benchmark superiority.
+| Module | Responsibility |
+| --- | --- |
+| `src/main.rs` | Entry point, signal handling, and exit status |
+| `src/engine.rs` | Conversation/tool loop, budgets, argument validation, workspace file operations, shell execution, and cancellation checks |
+| `src/auth.rs` | Read-only Codex credential discovery and profile validation |
+| `src/skills.rs` | Skill discovery, metadata catalog, and on-demand instruction loading |
+| `src/session.rs` | Private snapshots, writer locks, recovery notices, and session summaries |
+| `src/ui.rs` | Terminal frontend, approval prompts, tool summaries, and model-output rendering |
+| `src/ui/cli.rs` | CLI options, interactive commands, resume, and reload |
+| `src/ui/input.rs` | Unicode-aware input editing, history, and terminal mode management |
+| `src/ui/picker.rs` | Searchable workspace session switcher |
 
-## Ownership
+The engine has no terminal I/O or presentation dependency. Its `Frontend` interface receives tool activity, diagnostics, and approval requests; inference is supplied as a callback. This lets tests exercise the engine without a terminal. These are in-process module boundaries, not a client/server protocol.
 
-`llm-api` owns provider selection, encoding, streaming normalization, authentication headers, usage, finish reasons, and native replay. `agent` owns the conversation, prompt, tool schemas, argument checks, approval, filesystem effects, subprocesses, and terminal rendering. Current `llm-api` providers are OpenAI, Anthropic, OpenRouter, and Codex; its older README provider roster is not authoritative.
+Direct dependencies are `llm-api`, `serde_json`, `libc`, `unicode-segmentation`, `unicode-width`, and `termimad`. The Cargo manifest currently uses a sibling checkout for `llm-api`; this is a build requirement, not a documentation reference. No external source or design review is needed to understand these docs.
 
-There is one sequential loop: user message → `Client::run_cancellable` → intact assistant message → validated/authorized tools → user-role results → next request. Failed tools are observable results. Model/protocol/budget errors terminate rather than silently retrying effects. Output control characters are escaped before terminal rendering, but the model receives the raw bounded output.
+## Conversation and tools
 
-### Engine / frontend boundary
+The loop is:
 
-- `src/engine.rs`: conversation/tool loop, budgets, validation, approval policy, workspace containment, file operations, subprocesses, and cancellation checks. It has no terminal I/O, styling, or dependency on `ui`.
-- `src/skills.rs` and `src/auth.rs`: skill and credential logic; skill discovery reports raw diagnostics through the frontend port rather than printing.
-- `src/ui.rs`: terminal adapter for the engine's `Frontend` port, full approval prompts, compact/verbose tool summaries, escaping, styles, and streamed model presentation.
-- `src/ui/input.rs`: terminal input editing and redraw.
-- `src/ui/cli.rs`: CLI configuration and interactive controller (including `/clear`, `/quit`, and displaying inference events).
-- `src/main.rs`: wiring and process signal/exit handling.
+1. Append the user message and checkpoint the request.
+2. Call the provider with cancellation support.
+3. Accept a complete assistant message, preserving its opaque provider replay data.
+4. Validate and authorize tool calls, execute them sequentially, and record ordered results.
+5. Continue until the model finishes, a budget is exceeded, an error occurs, or cancellation is requested.
 
-`Frontend` receives raw tool-start/tool-finish events, durations, diagnostics, and approval requests. The engine retains approval policy (`--yes` versus asking), checks cancellation after an approval reply, and revalidates files before writing. Inference is an injected callback, so rendering model deltas is not part of the engine. Tests exercise the engine with a nonterminal recorder as well as the real terminal adapter. Neither Markdown nor ANSI escapes are inserted into stored messages or tool results.
+Partial tool-call deltas and incomplete model responses are not executed. Tool failures become explicit results. Provider/protocol errors are not silently retried. The persistence checkpoints around effects are described in [saved sessions](SESSIONS.md).
 
-These are module boundaries, not separate packages or a wire protocol yet. A later server can own the engine, request/transcript, and tool execution, forwarding events to a client and awaiting explicit approval replies. That extraction still needs serializable event/request IDs, disconnect/approval failure policy, per-session cancellation instead of the process-global flag, and transport/authentication design. No server, RPC framework, or async runtime is introduced here.
+The available tools are `load_skill`, `read_file`, `write_file`, `edit_file`, and `shell`. File tools resolve paths against the canonical workspace and reject escapes. Edits require exactly one matching occurrence. Writes use atomic replacement and revalidate the destination after approval. Reads are limited to 1 MiB files; tool output is bounded to 32 KiB. Shell commands run through `/bin/sh` in the workspace, with a 60-second timeout and bounded stdout/stderr capture.
 
-### Terminal Markdown options
+**Tools are automatically allowed by default.** `--ask` requires confirmation for shell commands and file writes; `--yes` enables automatic approval. An approval prompt shows the complete proposed arguments even when ordinary tool output is compact. Nonterminal approval fails closed. These policies are not a sandbox: shell commands run with the user's full privileges and can access files outside the workspace.
 
-Basic completed-message rendering is low complexity; correct incremental rendering is moderate complexity. Markdown delimiters and code fences can span arbitrary model chunks, and later text can change the interpretation of earlier lines. Wrapping, tables, nested lists, resizing, and syntax highlighting add more work.
+The default per-prompt limits are 500 model calls and 4096 KiB of serialized context. The context limit is a byte budget, not a token estimate; provider limits still apply. Automatic compaction is not implemented.
 
-- `termimad` is a convenient ready-made terminal Markdown renderer (a supported Markdown subset, not full CommonMark). It is a small integration, but adds terminal/layout dependencies; check its supported syntax and transitive dependency cost before choosing it.
-- `pulldown-cmark` is a lean CommonMark parser, not a terminal renderer. Pairing its events with our ANSI styles gives more control and avoids adopting a UI framework, but wrapping/layout remain our responsibility.
+## Instructions, skills, and credentials
 
-For a minimal first implementation, render completed answer blocks in the UI, or buffer complete lines/blocks with explicit code-fence state. Do not parse individual network chunks independently. Keep reasoning separate, preserve raw Markdown for transcripts/pipes, respect `NO_COLOR`, and escape untrusted terminal controls before adding our own styles. Plain text remains the current behavior; no Markdown dependency or renderer is added in this refactor.
+A new session's system instructions combine the built-in prompt, workspace path, skill metadata catalog, and root `AGENTS.md` when present. Skills are loaded on demand by catalog name. Discovery searches user-level and workspace-level `.agents/skills` and agent-specific skill directories; later roots override earlier names. Skill loading can read installed skills outside the workspace without widening ordinary file-tool access. The CLI does not automatically assemble hierarchical subdirectory instructions.
 
-`src/auth.rs` owns Codex credential discovery: explicit environment credentials, an agent-owned version-1 profile, then a read-only fx compatibility profile. It never writes a login, refreshes a token, or moves auth discovery into `llm-api`. A native OAuth flow can later replace the compatibility bridge without changing the transport API; an agent-owned access-token file alone does not implement login/refresh.
+Supported provider modes are OpenAI, Anthropic, OpenRouter, and Codex. API-key modes use their corresponding environment variables. Codex credential discovery checks, in order:
 
-The direct dependencies besides `llm-api` are `serde_json`, `libc`, `unicode-segmentation`, and `unicode-width`. The Unicode helpers keep input deletion grapheme-aware and wrapped input rows within terminal cell boundaries. Serialization is already in the interface layer's dependency graph. `libc` provides Unix nonblocking pipes, process-group cleanup, and signal handling without an async runtime. The application is intentionally Unix-only for now; this does not add platform assumptions to the portable `llm-api` library.
+1. Both `CODEX_ACCESS_TOKEN` and `CODEX_ACCOUNT_ID`, if supplied.
+2. The agent-owned `codex-auth.json` profile under `AGENT_HOME` (default `~/.agent`).
+3. A read-only compatibility login at `$FX_HOME/chatgpt-auth.json` (default `~/.fx/chatgpt-auth.json`) when the agent-owned profile is absent.
 
-## Next boundaries, not initial features
+Profiles must be private, user-owned regular files, not symlinks, and no larger than 1 MiB. The version-1 profile contains `access_token`, `account_id`, and `expires_at_ms`; tokens expiring in less than a minute are rejected. The application does not perform OAuth login or token refresh, and never writes these profiles.
 
-Cancellation now uses `llm-api::Client::run_cancellable` with the signal handler's atomic flag. The library owns per-request socket shutdown and its scoped monitor; Unix signal/input/process handling stays in this application. Interactive chat keeps noncanonical, no-echo mode active during both prompts and model/tool output, preserving typeahead for the next prompt. Input uses nonblocking byte reads from a separately opened controlling terminal, with termios restored on chat exit and before reload. The grapheme-aware editor supports left/right, home/end, delete/backspace, and up/down navigation through in-memory submitted-input history, restoring the unfinished draft when moving past the newest entry. Approval prompts have separate, disposable history. This avoids stdio prefetch, shared-descriptor flag changes, and the terminal-flush race between readiness checks and reads. Input readiness uses `select` with a 25 ms blocking timeout for cancellation and resize checks. On macOS, `poll` on `/dev/tty` can return `POLLNVAL` immediately; treating that as readable and retrying an `EAGAIN` read caused an idle CPU spin. A controlling-PTY regression test verifies that idle waits actually sleep and consume little CPU. `src/ui/input.rs` owns editing and explicit multiline redraw, showing trailing rows when input exceeds the screen height, instead of relying on canonical erase across emulator soft wraps or OS-limited canonical input buffers. Interactive interruption keeps complete transcript messages and settled tool results, records a warning about effects, clears the flag only after request cleanup, and returns to the prompt. Batch interruption exits 130. No automatic side-effect retry or rollback is attempted.
+## Terminal behavior
 
-A fully responsive editing/steering UI remains deferred. DNS/connect cancellation is bounded rather than immediate; arbitrary callbacks and filesystem operations cannot be forcibly interrupted, and detached shell jobs may escape process-group cleanup.
+On a styled terminal, `termimad` renders buffered Markdown for answers and reasoning. Each role's text is flushed when the role changes or the request ends, including error/cancellation cleanup. Reasoning uses a distinct color. This is buffered rendering, not incremental Markdown parsing on every network chunk. Nonterminal output or `NO_COLOR` uses escaped plain streaming text, with a `Thinking:` label for reasoning. Rendering does not alter the stored request or tool results.
 
-Saved context snapshots and `/resume`/`/reload` are implemented in `src/session.rs`; see [session representation and effect boundaries](SESSIONS.md). Persistence keeps the existing request/message representation rather than introducing a parallel transcript format.
+Tool output is compact by default; `--verbose` shows full arguments and bounded results. Untrusted control characters are escaped before presentation. The session picker additionally flattens whitespace and clips entries by display width.
 
-Other deferred work: prompt revisions/forks; model-aware context budgeting and explicit compaction; hierarchical instruction enforcement; stronger path traversal using anchored descriptors; and external sandboxing. None is implied by the current approval prompt or path checks.
+Interactive chat keeps the controlling terminal in noncanonical, no-echo mode during both input and model/tool output, leaving typeahead available for the next prompt. Input uses nonblocking byte reads and `select` with a 25 ms timeout for interruption and resize checks. Terminal settings are restored on exit and before reload.
+
+The editor supports grapheme-aware left/right movement, Home/End, Delete/Backspace, and Up/Down navigation through in-memory submitted-input history. Moving past the newest history entry restores the unfinished draft. Wrapped input scrolls to keep the cursor visible. Approval prompts have separate disposable history. Prompt history is not persisted across restarts or reloads; saved conversation context is.
+
+`/resume` opens the searchable session picker; `/clear` starts a new session; `/reload` replaces the process with the executable at its captured startup path; `/quit` exits. Details are in [saved sessions](SESSIONS.md).
+
+## Cancellation and limits
+
+SIGINT sets a process-global flag. The engine checks it around inference, approval, and tool execution. Network requests use the provider client's cancellation path. Shell cleanup targets the child process group; completed effects are not rolled back. Interactive cancellation records a continuation warning and returns to the prompt; cancelled batch execution exits 130.
+
+Cancellation is cooperative, not an ability to preempt arbitrary filesystem work or callbacks. Detached shell jobs may escape process-group cleanup. There is no distributed session lock, exactly-once execution guarantee, filesystem rollback, external sandbox, RPC server, or live cross-machine synchronization. A remote frontend would still need event/request identifiers, transport and authentication, disconnect/approval policy, and per-session rather than process-global cancellation.
