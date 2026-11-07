@@ -382,29 +382,31 @@ fn turn(
             .map(|call| {
                 tool_number += 1;
                 let name = call["name"].as_str().unwrap_or("unknown");
-                if workspace.verbose {
-                    eprintln!(
+                let label = if workspace.verbose {
+                    format!(
                         "[{tool_number}] {} {}",
                         display(name),
                         display(&call["arguments"].to_string())
-                    );
+                    )
                 } else {
-                    eprintln!("[{tool_number}] {}", ui::label(name, &call["arguments"]));
-                }
+                    format!("[{tool_number}] {}", ui::label(name, &call["arguments"]))
+                };
+                ui::tool_activity(&label);
                 let started = Instant::now();
                 let result = field(call, "name")
                     .and_then(|name| workspace.execute(name, &call["arguments"]));
                 let is_error = result.is_err();
                 let output = result.unwrap_or_else(|e| e.to_string());
-                if workspace.verbose {
-                    eprintln!("{}", display(&limited(&output)));
+                let outcome = if workspace.verbose {
+                    display(&limited(&output))
                 } else {
-                    eprintln!(
+                    format!(
                         "[{tool_number}] {} · {:.1}s",
                         ui::outcome(name, &output, is_error),
                         started.elapsed().as_secs_f64()
-                    );
-                }
+                    )
+                };
+                ui::tool_activity(&outcome);
                 json!({"type":"tool_result","id":call["id"],"output":output,"is_error":is_error})
             })
             .collect();
@@ -575,7 +577,7 @@ fn chat(
             max_turns,
             max_context_bytes,
             |req| {
-                let styled = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+                let styled = ui::styles_enabled(io::stdout().is_terminal());
                 let mut stream = ui::StreamDisplay::new(styled);
                 let result = client.run_cancellable(req, &INTERRUPTED, |event| {
                     if check_interrupt().is_err() {

@@ -1,8 +1,8 @@
 //! A small wrapped input editor. Redraw all visible rows explicitly so erase
 //! works across line boundaries without relying on canonical terminal editing.
-use super::{Result, check_interrupt};
+use super::{Result, check_interrupt, ui};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use unicode_segmentation::UnicodeSegmentation;
@@ -89,6 +89,7 @@ fn redraw(
     text: &str,
     size: (usize, usize),
     painted_rows: &mut usize,
+    styled: bool,
 ) -> io::Result<()> {
     // Reserve the last column to avoid the emulator's pending soft-wrap state.
     let rows = wrapped_rows(text, size.0 - 1);
@@ -98,7 +99,11 @@ fn redraw(
     if up > 0 {
         write!(out, "\x1b[{up}A")?;
     }
-    write!(out, "\x1b[J{}", visible.join("\r\n"))?;
+    write!(
+        out,
+        "\x1b[J{}",
+        ui::styled(&visible.join("\r\n"), ui::Style::Input, styled)
+    )?;
     *painted_rows = visible.len();
     out.flush()
 }
@@ -107,6 +112,7 @@ pub fn read_line(prompt: &str) -> Result<String> {
     check_interrupt()?;
     let restore = Terminal::enter()?;
     let input_fd = restore.input.as_raw_fd();
+    let styled = ui::styles_enabled(io::stderr().is_terminal());
     let mut out = io::stderr().lock();
     let mut line = String::new();
     let mut pending = Vec::new();
@@ -122,7 +128,7 @@ pub fn read_line(prompt: &str) -> Result<String> {
         if size != last_size || (dirty && painted.elapsed() >= std::time::Duration::from_millis(16))
         {
             let text = format!("{prompt}{line}");
-            redraw(&mut out, &text, size, &mut painted_rows)?;
+            redraw(&mut out, &text, size, &mut painted_rows, styled)?;
             dirty = false;
             last_size = size;
             painted = std::time::Instant::now();
@@ -172,7 +178,7 @@ pub fn read_line(prompt: &str) -> Result<String> {
         match byte {
             b'\r' | b'\n' => {
                 let text = format!("{prompt}{line}");
-                redraw(&mut out, &text, size, &mut painted_rows)?;
+                redraw(&mut out, &text, size, &mut painted_rows, styled)?;
                 writeln!(out)?;
                 out.flush()?;
                 return Ok(format!("{line}\n"));
@@ -231,20 +237,32 @@ mod tests {
     fn redraw_clears_old_rows_after_backspace_or_clear() {
         let mut out = Vec::new();
         let mut painted = 0;
-        redraw(&mut out, "> abcdef", (6, 24), &mut painted).unwrap();
+        redraw(&mut out, "> abcdef", (6, 24), &mut painted, false).unwrap();
         assert_eq!(out, b"\r\x1b[J> abc\r\ndef");
         assert_eq!(painted, 2);
         out.clear();
-        redraw(&mut out, "> ab", (6, 24), &mut painted).unwrap();
+        redraw(&mut out, "> ab", (6, 24), &mut painted, false).unwrap();
         assert_eq!(out, b"\r\x1b[1A\x1b[J> ab");
         assert_eq!(painted, 1);
+    }
+
+    #[test]
+    fn colored_input_wraps_by_visible_width_and_resets_style() {
+        let mut out = Vec::new();
+        let mut painted = 0;
+        redraw(&mut out, "> 界abcd", (6, 24), &mut painted, true).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\r\x1b[J\x1b[0;36m> 界a\r\nbcd\x1b[0m"
+        );
+        assert_eq!(painted, 2);
     }
 
     #[test]
     fn long_input_keeps_the_tail_within_screen_height() {
         let mut out = Vec::new();
         let mut painted = 0;
-        redraw(&mut out, "> abcdefghijk", (6, 3), &mut painted).unwrap();
+        redraw(&mut out, "> abcdefghijk", (6, 3), &mut painted, false).unwrap();
         assert_eq!(out, b"\r\x1b[Jdefgh\r\nijk");
         assert_eq!(painted, 2);
     }

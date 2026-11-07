@@ -1,6 +1,44 @@
 //! Terminal-only summaries. Never shorten the tool results sent to the model.
 use super::display;
 use serde_json::Value;
+use std::io::{self, IsTerminal};
+
+pub fn styles_enabled(terminal: bool) -> bool {
+    terminal && std::env::var_os("NO_COLOR").is_none()
+}
+
+#[derive(Clone, Copy)]
+pub enum Style {
+    Input,
+    Tool,
+    Reasoning,
+    Answer,
+}
+
+/// Wrap already-escaped text, resetting every fragment to avoid style leakage.
+pub fn styled(text: &str, style: Style, enabled: bool) -> String {
+    if !enabled {
+        return text.into();
+    }
+    let code = match style {
+        Style::Input => "0;36",
+        Style::Tool => "0;2",
+        Style::Reasoning => "0;2;3",
+        Style::Answer => "0;39",
+    };
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+pub fn tool_activity(text: &str) {
+    eprintln!(
+        "{}",
+        styled(
+            text,
+            Style::Tool,
+            styles_enabled(io::stderr().is_terminal())
+        )
+    );
+}
 
 fn short(value: &str, width: usize) -> String {
     let safe = display(value).replace('\n', "\\n").replace('\t', "\\t");
@@ -116,13 +154,16 @@ impl StreamDisplay {
             }
         }
         self.reasoning = Some(reasoning);
-        let safe = display(text);
-        if reasoning && self.styled {
-            out.push_str(&format!("\x1b[2;3m{safe}\x1b[0m"));
-        } else {
-            out.push_str(&safe);
-        }
-        out
+        out.push_str(&display(text));
+        styled(
+            &out,
+            if reasoning {
+                Style::Reasoning
+            } else {
+                Style::Answer
+            },
+            self.styled,
+        )
     }
 
     pub fn finish(&mut self) -> &'static str {
@@ -138,6 +179,21 @@ impl StreamDisplay {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn roles_have_distinct_styles_and_plain_output_is_unchanged() {
+        let styles = [Style::Input, Style::Tool, Style::Reasoning, Style::Answer];
+        let codes = ["0;36", "0;2", "0;2;3", "0;39"];
+        for (style, code) in styles.into_iter().zip(codes) {
+            assert_eq!(
+                styled("text", style, true),
+                format!("\x1b[{code}mtext\x1b[0m")
+            );
+            assert_eq!(styled("text", style, false), "text");
+        }
+        assert!(!styles_enabled(false));
+        assert_eq!(styles_enabled(true), std::env::var_os("NO_COLOR").is_none());
+    }
 
     #[test]
     fn reasoning_streams_separately_from_answers() {
@@ -171,15 +227,15 @@ mod tests {
         );
         assert_eq!(stream.finish(), "");
         let chunk = stream.delta(&json!({"type":"reasoning_delta","delta":"hi\u{1b}[0m"}));
-        assert_eq!(chunk, "Thinking:\n\x1b[2;3mhi\\u{1b}[0m\x1b[0m");
+        assert_eq!(chunk, "\x1b[0;2;3mThinking:\nhi\\u{1b}[0m\x1b[0m");
         assert_eq!(stream.finish(), "\n");
         assert_eq!(
             stream.delta(&json!({"type":"text_delta","delta":"Normal"})),
-            "Normal"
+            "\x1b[0;39mNormal\x1b[0m"
         );
         assert_eq!(
             stream.delta(&json!({"type":"reasoning_delta","delta":"Again"})),
-            "\n\nThinking:\n\x1b[2;3mAgain\x1b[0m"
+            "\x1b[0;2;3m\n\nThinking:\nAgain\x1b[0m"
         );
     }
 
