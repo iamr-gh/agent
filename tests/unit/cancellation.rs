@@ -380,6 +380,76 @@ fn long_input_backspaces_across_viewports_and_submits_exact_text() {
 }
 
 #[test]
+fn cursor_editing_and_history_preserve_the_draft() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    // Insert before a wide grapheme, erase a combining grapheme, then delete.
+    process.send("a界e\u{301}z\x1b[D\x7f\x1b[DX\x1b[C\x1b[3~\n");
+    let (stream, body) = server.request();
+    assert_user_text(&body, "aX界\n");
+    done(stream);
+    process.expect("> ");
+    // Down restores the unfinished draft; repeated up/down is bounded.
+    process.send("draft\x1b[A\x1b[A\x1b[B\x1b[B!\n");
+    let (stream, body) = server.request();
+    assert_user_text(&body, "draft!\n");
+    done(stream);
+    process.expect("> ");
+    // Recall the older entry and edit it rather than only displaying history.
+    process.send("\x1b[A\x1b[A\x1b[H\x1b[3~Q\x1b[F!\n");
+    let (stream, body) = server.request();
+    assert_user_text(&body, "QX界!\n");
+    done(stream);
+    process.expect("> ");
+    process.quit();
+}
+
+fn assert_user_text(body: &Value, expected: &str) {
+    let message = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    assert!(
+        message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["text"] == expected),
+        "unexpected input: {body}"
+    );
+}
+
+#[test]
+fn input_typed_during_response_survives_until_the_next_prompt() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    process.send("first\n");
+    let (stream, _) = server.request();
+    // Queue an unfinished line while the model request is still running.
+    process.send("queued ac\x1b[Db");
+    done(stream);
+    process.expect("queued abc");
+    process.send("\n");
+    let (stream, body) = server.request();
+    assert_user_text(&body, "queued abc\n");
+    // A complete queued prompt must also survive the transition.
+    process.send("third\n");
+    done(stream);
+    let (stream, body) = server.request();
+    assert_user_text(&body, "third\n");
+    done(stream);
+    process.expect("> ");
+    process.quit();
+}
+
+#[test]
 fn idle_prompt_interrupt_then_quit() {
     let fixture = Fixture::new();
     let server = Server::new();

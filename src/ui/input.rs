@@ -8,7 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-struct Terminal {
+pub(super) struct Terminal {
     mode: libc::termios,
     input: File,
 }
@@ -22,7 +22,7 @@ impl Drop for Terminal {
     }
 }
 impl Terminal {
-    fn enter() -> io::Result<Self> {
+    pub(super) fn enter() -> io::Result<Self> {
         // A separate open description avoids making stdout/stderr nonblocking
         // when a PTY launcher gave all three streams the same underlying handle.
         let input = OpenOptions::new()
@@ -91,9 +91,31 @@ fn redraw(
     painted_rows: &mut usize,
     styled: bool,
 ) -> io::Result<()> {
+    redraw_cursor(out, text, text.len(), size, painted_rows, styled)
+}
+
+fn redraw_cursor(
+    out: &mut impl Write,
+    text: &str,
+    cursor: usize,
+    size: (usize, usize),
+    painted_rows: &mut usize,
+    styled: bool,
+) -> io::Result<()> {
     // Reserve the last column to avoid the emulator's pending soft-wrap state.
     let rows = wrapped_rows(text, size.0 - 1);
-    let visible = &rows[rows.len().saturating_sub(size.1 - 1)..];
+    let mut remaining = cursor;
+    let mut cursor_row = 0;
+    for row in &rows {
+        if remaining <= row.len() {
+            break;
+        }
+        remaining -= row.len();
+        cursor_row += 1;
+    }
+    let column = rows[cursor_row][..remaining].width();
+    let start = cursor_row.saturating_sub(size.1 - 2);
+    let visible = &rows[start..rows.len().min(start + size.1 - 1)];
     write!(out, "\r")?;
     let up = painted_rows.saturating_sub(1).min(size.1 - 1);
     if up > 0 {
@@ -104,7 +126,17 @@ fn redraw(
         "\x1b[J{}",
         ui::styled(&visible.join("\r\n"), ui::Style::Input, styled)
     )?;
-    *painted_rows = visible.len();
+    let below = visible.len() - 1 - (cursor_row - start);
+    if below > 0 {
+        write!(out, "\x1b[{below}A")?;
+    }
+    if cursor != text.len() {
+        write!(out, "\r")?;
+        if column > 0 {
+            write!(out, "\x1b[{column}C")?;
+        }
+    }
+    *painted_rows = cursor_row - start + 1;
     out.flush()
 }
 
@@ -143,15 +175,107 @@ fn wait_for_input(fd: RawFd) -> io::Result<bool> {
     }
 }
 
+#[derive(Default)]
+struct Editor {
+    line: String,
+    cursor: usize,
+    history_index: usize,
+    draft: String,
+}
+
+impl Editor {
+    fn left(&mut self) {
+        self.cursor = self.line[..self.cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(i, _)| i);
+    }
+
+    fn right(&mut self) {
+        if let Some(g) = self.line[self.cursor..].graphemes(true).next() {
+            self.cursor += g.len();
+        }
+    }
+
+    fn insert(&mut self, text: &str) {
+        self.line.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        // Inserting a base before a combining mark can join graphemes.
+        while self.cursor < self.line.len()
+            && !self
+                .line
+                .grapheme_indices(true)
+                .any(|(i, _)| i == self.cursor)
+        {
+            self.cursor += self.line[self.cursor..].chars().next().unwrap().len_utf8();
+        }
+    }
+
+    fn history(&mut self, history: &[String], up: bool) {
+        if up {
+            if self.history_index == 0 {
+                return;
+            }
+            if self.history_index == history.len() {
+                self.draft = self.line.clone();
+            }
+            self.history_index -= 1;
+        } else if self.history_index < history.len() {
+            self.history_index += 1;
+        } else {
+            return;
+        }
+        self.line = history
+            .get(self.history_index)
+            .unwrap_or(&self.draft)
+            .clone();
+        self.cursor = self.line.len();
+    }
+
+    fn key(&mut self, sequence: &[u8], history: &[String]) {
+        match sequence {
+            b"[D" | b"OD" => self.left(),
+            b"[C" | b"OC" => self.right(),
+            b"[A" | b"OA" => self.history(history, true),
+            b"[B" | b"OB" => self.history(history, false),
+            b"[H" | b"OH" | b"[1~" | b"[7~" => self.cursor = 0,
+            b"[F" | b"OF" | b"[4~" | b"[8~" => self.cursor = self.line.len(),
+            b"[3~" => {
+                let start = self.cursor;
+                self.right();
+                self.line.replace_range(start..self.cursor, "");
+                self.cursor = start;
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn read_line(prompt: &str) -> Result<String> {
+    read_line_with_history(prompt, &mut Vec::new())
+}
+
+pub(super) fn read_line_with_history(prompt: &str, history: &mut Vec<String>) -> Result<String> {
+    let result = edit_line(prompt, history)?;
+    let entry = result.trim_end_matches('\n');
+    if !entry.is_empty() && history.last().is_none_or(|last| last != entry) {
+        history.push(entry.to_owned());
+    }
+    Ok(result)
+}
+
+fn edit_line(prompt: &str, history: &[String]) -> Result<String> {
     check_interrupt()?;
     let restore = Terminal::enter()?;
     let input_fd = restore.input.as_raw_fd();
     let styled = ui::styles_enabled(io::stderr().is_terminal());
     let mut out = io::stderr().lock();
-    let mut line = String::new();
+    let mut editor = Editor {
+        history_index: history.len(),
+        ..Editor::default()
+    };
     let mut pending = Vec::new();
-    let mut escape = 0;
+    let mut escape = Vec::new();
     let mut last_size = (0, 0);
     let mut painted_rows = 0;
     let mut dirty = true;
@@ -162,8 +286,15 @@ pub fn read_line(prompt: &str) -> Result<String> {
         // Coalesce bursts (paste/key repeat) instead of flooding the terminal.
         if size != last_size || (dirty && painted.elapsed() >= std::time::Duration::from_millis(16))
         {
-            let text = format!("{prompt}{line}");
-            redraw(&mut out, &text, size, &mut painted_rows, styled)?;
+            let text = format!("{prompt}{}", editor.line);
+            redraw_cursor(
+                &mut out,
+                &text,
+                prompt.len() + editor.cursor,
+                size,
+                &mut painted_rows,
+                styled,
+            )?;
             dirty = false;
             last_size = size;
             painted = std::time::Instant::now();
@@ -191,39 +322,49 @@ pub fn read_line(prompt: &str) -> Result<String> {
             return Ok(String::new());
         }
         check_interrupt()?;
-        // Ignore terminal key sequences rather than inserting their printable tail.
-        if escape != 0 {
-            if escape == 1 && matches!(byte, b'[' | b'O') {
-                escape = 2;
-            } else if escape == 1 || (0x40..=0x7e).contains(&byte) {
-                escape = 0;
+        if !escape.is_empty() {
+            escape.push(byte);
+            if escape.len() == 2 && matches!(byte, b'[' | b'O') {
+                continue;
+            }
+            if (0x40..=0x7e).contains(&byte) || escape.len() > 32 {
+                editor.key(&escape[1..], history);
+                escape.clear();
+                dirty = true;
             }
             continue;
         }
         match byte {
             b'\r' | b'\n' => {
-                let text = format!("{prompt}{line}");
+                let text = format!("{prompt}{}", editor.line);
                 redraw(&mut out, &text, size, &mut painted_rows, styled)?;
                 writeln!(out)?;
                 out.flush()?;
-                return Ok(format!("{line}\n"));
+                return Ok(format!("{}\n", editor.line));
             }
-            4 if line.is_empty() => return Ok(String::new()),
+            4 if editor.line.is_empty() => return Ok(String::new()),
+            1 => editor.cursor = 0,                 // Ctrl-A
+            5 => editor.cursor = editor.line.len(), // Ctrl-E
             8 | 127 => {
                 pending.clear();
-                if let Some((i, _)) = line.grapheme_indices(true).next_back() {
-                    line.truncate(i);
-                }
+                let end = editor.cursor;
+                editor.left();
+                editor.line.replace_range(editor.cursor..end, "");
             }
-            21 => line.clear(), // Ctrl-U
+            21 => {
+                editor.line.replace_range(..editor.cursor, "");
+                editor.cursor = 0;
+            }
             23 => {
-                // Ctrl-W
-                let trimmed = line.trim_end();
-                let end = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
-                line.truncate(end);
+                // Ctrl-W deletes the word before the cursor, preserving the suffix.
+                let trimmed = editor.line[..editor.cursor].trim_end();
+                let start = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                editor.line.replace_range(start..editor.cursor, "");
+                editor.cursor = start;
             }
             27 => {
-                escape = 1;
+                pending.clear();
+                escape.push(27);
                 continue;
             }
             0..=31 => continue,
@@ -231,7 +372,7 @@ pub fn read_line(prompt: &str) -> Result<String> {
                 pending.push(byte);
                 match std::str::from_utf8(&pending) {
                     Ok(s) => {
-                        line.push_str(s);
+                        editor.insert(s);
                         pending.clear();
                     }
                     Err(e) if e.error_len().is_none() => continue,
@@ -374,6 +515,21 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "\r\x1b[J\x1b[0;36m> 界a\r\nbcd\x1b[0m"
         );
+        assert_eq!(painted, 2);
+    }
+
+    #[test]
+    fn cursor_redraw_tracks_wrapped_rows_and_scrolls_back_to_the_start() {
+        let mut out = Vec::new();
+        let mut painted = 0;
+        redraw(&mut out, "> abcdefghijk", (6, 3), &mut painted, false).unwrap();
+        out.clear();
+        redraw_cursor(&mut out, "> abcdefghijk", 3, (6, 3), &mut painted, false).unwrap();
+        assert_eq!(out, b"\r\x1b[1A\x1b[J> abc\r\ndefgh\x1b[1A\r\x1b[3C");
+        assert_eq!(painted, 1);
+        out.clear();
+        redraw_cursor(&mut out, "> abcdefghijk", 8, (6, 3), &mut painted, false).unwrap();
+        assert_eq!(out, b"\r\x1b[J> abc\r\ndefgh\r\x1b[3C");
         assert_eq!(painted, 2);
     }
 

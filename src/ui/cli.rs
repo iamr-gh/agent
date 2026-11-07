@@ -188,13 +188,22 @@ fn chat_session(
     if interactive && !io::stdin().is_terminal() {
         return Err("provide a prompt argument for noninteractive use".into());
     }
+    // Keep noncanonical, no-echo input active during model/tool output too.
+    // Otherwise the terminal line discipline edits or discards typeahead before
+    // the prompt editor can see it. No reader competes with the prompt editor.
+    let mut terminal = if interactive {
+        Some(input::Terminal::enter()?)
+    } else {
+        None
+    };
+    let mut history = Vec::new();
     if session.store.is_some() {
         preview(&session);
     }
     loop {
         let input = if interactive {
             eprintln!();
-            let input = match input::read_line("> ") {
+            let input = match input::read_line_with_history("> ", &mut history) {
                 Ok(input) => input,
                 Err(e) if e.is::<llm_api::Cancelled>() => {
                     INTERRUPTED.store(false, Ordering::Relaxed);
@@ -231,6 +240,9 @@ fn chat_session(
                     session.save(false)?;
                     if let Some(store) = &session.store {
                         use std::os::unix::process::CommandExt;
+                        // exec does not run destructors: restore the original
+                        // terminal mode before replacing this process.
+                        drop(terminal.take());
                         let error = std::process::Command::new(&executable)
                             .current_dir(&workspace.root)
                             .args([
@@ -246,6 +258,7 @@ fn chat_session(
                                 &(max_context_bytes / 1024).to_string(),
                             ])
                             .exec();
+                        terminal = Some(input::Terminal::enter()?);
                         eprintln!("reload failed: {error}");
                     }
                     continue;
