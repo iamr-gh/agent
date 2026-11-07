@@ -92,8 +92,6 @@ pub fn styles_enabled(terminal: bool) -> bool {
 pub enum Style {
     Input,
     Tool,
-    Reasoning,
-    Answer,
 }
 
 /// Wrap already-escaped text, resetting every fragment to avoid style leakage.
@@ -104,8 +102,6 @@ pub fn styled(text: &str, style: Style, enabled: bool) -> String {
     let code = match style {
         Style::Input => "0;36",
         Style::Tool => "0;33",
-        Style::Reasoning => "0;3;35",
-        Style::Answer => "0;39",
     };
     format!("\x1b[{code}m{text}\x1b[0m")
 }
@@ -200,12 +196,12 @@ pub fn outcome(name: &str, output: &str, is_error: bool) -> String {
     }
 }
 
-/// Stream reasoning and plain output; buffer terminal answers for Markdown parsing.
+/// Stream plain output; buffer each terminal role for Markdown parsing.
 /// Flush buffered text even on cancellation/errors, without changing the transcript.
 pub struct StreamDisplay {
     styled: bool,
     reasoning: Option<bool>,
-    answer: String,
+    pending: String,
 }
 
 impl StreamDisplay {
@@ -213,7 +209,7 @@ impl StreamDisplay {
         Self {
             styled,
             reasoning: None,
-            answer: String::new(),
+            pending: String::new(),
         }
     }
 
@@ -227,12 +223,9 @@ impl StreamDisplay {
         if text.is_empty() {
             return String::new();
         }
-        if self.styled && !reasoning {
-            self.answer.push_str(text);
-            return String::new();
-        }
-        let mut out = self.flush_answer();
+        let mut out = String::new();
         if self.reasoning != Some(reasoning) {
+            out.push_str(&self.flush_pending());
             if self.reasoning.is_some() {
                 out.push_str("\n\n");
             }
@@ -242,34 +235,28 @@ impl StreamDisplay {
             }
         }
         self.reasoning = Some(reasoning);
-        out.push_str(&styled(
-            &display(text),
-            if reasoning {
-                Style::Reasoning
-            } else {
-                Style::Answer
-            },
-            self.styled,
-        ));
+        if self.styled {
+            self.pending.push_str(text);
+        } else {
+            out.push_str(&display(text));
+        }
         out
     }
 
-    fn flush_answer(&mut self) -> String {
-        if self.answer.is_empty() {
+    fn flush_pending(&mut self) -> String {
+        if self.pending.is_empty() {
             return String::new();
         }
-        let prefix = if self.reasoning == Some(true) {
-            "\n\n"
-        } else {
-            ""
-        };
-        let safe = display(&std::mem::take(&mut self.answer));
-        self.reasoning = Some(false);
-        format!("{prefix}{}", termimad::term_text(&safe))
+        let safe = display(&std::mem::take(&mut self.pending));
+        let mut skin = termimad::MadSkin::default();
+        if self.reasoning == Some(true) {
+            skin.set_fg(termimad::crossterm::style::Color::DarkMagenta);
+        }
+        skin.term_text(&safe).to_string()
     }
 
     pub fn finish(&mut self) -> String {
-        let mut out = self.flush_answer();
+        let mut out = self.flush_pending();
         if self.reasoning.take().is_some() && !out.ends_with('\n') {
             out.push('\n');
         }
@@ -284,8 +271,8 @@ mod tests {
 
     #[test]
     fn roles_have_distinct_styles_and_plain_output_is_unchanged() {
-        let styles = [Style::Input, Style::Tool, Style::Reasoning, Style::Answer];
-        let codes = ["0;36", "0;33", "0;3;35", "0;39"];
+        let styles = [Style::Input, Style::Tool];
+        let codes = ["0;36", "0;33"];
         for (style, code) in styles.into_iter().zip(codes) {
             assert_eq!(
                 styled("text", style, true),
@@ -321,27 +308,30 @@ mod tests {
     }
 
     #[test]
-    fn streaming_styles_are_reset_and_untrusted_controls_are_escaped() {
+    fn reasoning_markdown_is_colored_without_forced_italics_and_flushes_on_role_change() {
         let mut stream = StreamDisplay::new(true);
-        assert_eq!(
-            stream.delta(&json!({"type":"reasoning_delta","delta":""})),
-            ""
-        );
         assert_eq!(stream.finish(), "");
-        let chunk = stream.delta(&json!({"type":"reasoning_delta","delta":"hi\u{1b}[0m"}));
-        assert_eq!(chunk, "\x1b[0;3;35mhi\\u{1b}[0m\x1b[0m");
-        assert_eq!(
-            stream.delta(&json!({"type":"reasoning_delta","delta":" continued"})),
-            "\x1b[0;3;35m continued\x1b[0m"
-        );
-        assert_eq!(stream.finish(), "\n");
-        assert_eq!(
-            stream.delta(&json!({"type":"text_delta","delta":"Normal"})),
-            ""
-        );
-        let chunk = stream.delta(&json!({"type":"reasoning_delta","delta":"Again"}));
-        assert!(chunk.contains("Normal"));
-        assert!(chunk.ends_with("\n\n\x1b[0;3;35mAgain\x1b[0m"));
+        for text in ["plain **bo", "ld**\u{1b}[0m"] {
+            assert_eq!(
+                stream.delta(&json!({"type":"reasoning_delta","delta":text})),
+                ""
+            );
+        }
+        let reasoning = stream.delta(&json!({"type":"text_delta","delta":"Answer"}));
+        assert!(reasoning.contains("plain "));
+        assert!(reasoning.contains("bold"));
+        assert!(!reasoning.contains("**"));
+        assert!(reasoning.contains("\\u{1b}[0m"));
+        assert!(reasoning.contains("\x1b[38;5;5m"), "{reasoning:?}");
+        assert!(!reasoning.contains("\x1b[3m"));
+        let answer = stream.delta(&json!({"type":"reasoning_delta","delta":"*italic*"}));
+        assert!(answer.contains("Answer"));
+        assert!(!answer.contains("\x1b[38;5;5m"));
+        let final_reasoning = stream.finish();
+        assert!(final_reasoning.contains("italic"));
+        assert!(!final_reasoning.contains("*italic*"));
+        assert!(final_reasoning.contains("\x1b[3m"));
+        assert_eq!(stream.finish(), "");
     }
 
     #[test]
@@ -374,9 +364,10 @@ mod tests {
         );
         let mut terminal = StreamDisplay::new(true);
         terminal.delta(&json!({"type":"reasoning_delta","delta":"Thinking"}));
-        terminal.delta(&json!({"type":"text_delta","delta":raw}));
+        let reasoning = terminal.delta(&json!({"type":"text_delta","delta":raw}));
+        assert!(reasoning.contains("Thinking"));
+        assert!(reasoning.ends_with("\n\n"));
         let rendered = terminal.finish();
-        assert!(rendered.starts_with("\n\n"));
         assert!(rendered.contains("\\u{1b}[31m\\r"));
         assert!(!rendered.contains("\u{1b}[31m"));
         assert_eq!(terminal.finish(), "");
