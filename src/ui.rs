@@ -103,8 +103,8 @@ pub fn styled(text: &str, style: Style, enabled: bool) -> String {
     }
     let code = match style {
         Style::Input => "0;36",
-        Style::Tool => "0;2",
-        Style::Reasoning => "0;2;3",
+        Style::Tool => "0;33",
+        Style::Reasoning => "0;3;35",
         Style::Answer => "0;39",
     };
     format!("\x1b[{code}m{text}\x1b[0m")
@@ -201,7 +201,7 @@ pub fn outcome(name: &str, output: &str, is_error: bool) -> String {
 }
 
 /// Small streaming renderer: keep reasoning distinct without buffering it.
-/// Style each chunk separately so cancellation/errors cannot leave the terminal dim.
+/// Style each chunk separately so cancellation/errors cannot leave styles active.
 pub struct StreamDisplay {
     styled: bool,
     reasoning: Option<bool>,
@@ -230,7 +230,8 @@ impl StreamDisplay {
             if self.reasoning.is_some() {
                 out.push_str("\n\n");
             }
-            if reasoning {
+            // Plain output needs a label; styled reasoning is already distinct.
+            if reasoning && !self.styled {
                 out.push_str("Thinking:\n");
             }
         }
@@ -264,7 +265,7 @@ mod tests {
     #[test]
     fn roles_have_distinct_styles_and_plain_output_is_unchanged() {
         let styles = [Style::Input, Style::Tool, Style::Reasoning, Style::Answer];
-        let codes = ["0;36", "0;2", "0;2;3", "0;39"];
+        let codes = ["0;36", "0;33", "0;3;35", "0;39"];
         for (style, code) in styles.into_iter().zip(codes) {
             assert_eq!(
                 styled("text", style, true),
@@ -308,7 +309,11 @@ mod tests {
         );
         assert_eq!(stream.finish(), "");
         let chunk = stream.delta(&json!({"type":"reasoning_delta","delta":"hi\u{1b}[0m"}));
-        assert_eq!(chunk, "\x1b[0;2;3mThinking:\nhi\\u{1b}[0m\x1b[0m");
+        assert_eq!(chunk, "\x1b[0;3;35mhi\\u{1b}[0m\x1b[0m");
+        assert_eq!(
+            stream.delta(&json!({"type":"reasoning_delta","delta":" continued"})),
+            "\x1b[0;3;35m continued\x1b[0m"
+        );
         assert_eq!(stream.finish(), "\n");
         assert_eq!(
             stream.delta(&json!({"type":"text_delta","delta":"Normal"})),
@@ -316,7 +321,7 @@ mod tests {
         );
         assert_eq!(
             stream.delta(&json!({"type":"reasoning_delta","delta":"Again"})),
-            "\x1b[0;2;3m\n\nThinking:\nAgain\x1b[0m"
+            "\x1b[0;3;35m\n\nAgain\x1b[0m"
         );
     }
 
