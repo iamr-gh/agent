@@ -1,5 +1,6 @@
 mod auth;
 mod engine;
+mod session;
 mod skills;
 mod ui;
 

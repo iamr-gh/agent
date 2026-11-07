@@ -311,12 +311,31 @@ pub(crate) fn shell(root: &Path, command: &str, timeout: Duration) -> Result<Str
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn turn(
     request: &mut Request,
     workspace: &Workspace,
     max_turns: usize,
     max_context_bytes: usize,
+    infer: impl FnMut(&Request) -> Result<Response>,
+) -> Result<()> {
+    turn_saved(
+        request,
+        workspace,
+        max_turns,
+        max_context_bytes,
+        infer,
+        |_| Ok(()),
+    )
+}
+
+pub(crate) fn turn_saved(
+    request: &mut Request,
+    workspace: &Workspace,
+    max_turns: usize,
+    max_context_bytes: usize,
     mut infer: impl FnMut(&Request) -> Result<Response>,
+    mut checkpoint: impl FnMut(&Request) -> Result<()>,
 ) -> Result<()> {
     let mut tool_number = 0;
     for _ in 0..max_turns {
@@ -334,7 +353,6 @@ pub(crate) fn turn(
             .cloned()
             .collect();
         if response.finish_reason != "tool_calls" {
-            request.messages.push(response.message);
             if !calls.is_empty() || response.finish_reason != "stop" {
                 return Err(format!(
                     "incomplete response: {} (no tools executed)",
@@ -342,6 +360,8 @@ pub(crate) fn turn(
                 )
                 .into());
             }
+            request.messages.push(response.message);
+            checkpoint(request)?;
             return Ok(());
         }
         if calls.is_empty() || calls.len() > 32 {
@@ -354,27 +374,13 @@ pub(crate) fn turn(
             }
         }
         request.messages.push(response.message); // Preserve native reasoning replay intact.
+        // Persist a settled placeholder for every call before any effects. A crash
+        // can leave uncertainty, but never an executable call awaiting replay.
         let content = calls
             .iter()
             .map(|call| {
-                tool_number += 1;
-                let name = call["name"].as_str().unwrap_or("unknown");
-                workspace
-                    .frontend
-                    .tool_started(tool_number, name, &call["arguments"]);
-                let started = Instant::now();
-                let result = field(call, "name")
-                    .and_then(|name| workspace.execute(name, &call["arguments"]));
-                let is_error = result.is_err();
-                let output = result.unwrap_or_else(|e| e.to_string());
-                workspace.frontend.tool_finished(
-                    tool_number,
-                    name,
-                    &output,
-                    is_error,
-                    started.elapsed(),
-                );
-                json!({"type":"tool_result","id":call["id"],"output":output,"is_error":is_error})
+                json!({"type":"tool_result", "id":call["id"],
+            "output":"Interrupted: tool not executed.", "is_error":true})
             })
             .collect();
         request.messages.push(Message {
@@ -382,6 +388,33 @@ pub(crate) fn turn(
             content,
             replay: None,
         });
+        checkpoint(request)?;
+        let results = request.messages.len() - 1;
+        for (index, call) in calls.iter().enumerate() {
+            tool_number += 1;
+            let name = call["name"].as_str().unwrap_or("unknown");
+            request.messages[results].content[index]["output"] = json!(
+                "Interrupted: tool outcome unknown; effects may remain. Inspect state before retrying."
+            );
+            checkpoint(request)?; // Durable intent before approval/execution.
+            workspace
+                .frontend
+                .tool_started(tool_number, name, &call["arguments"]);
+            let started = Instant::now();
+            let result =
+                field(call, "name").and_then(|name| workspace.execute(name, &call["arguments"]));
+            let is_error = result.is_err();
+            let output = result.unwrap_or_else(|e| e.to_string());
+            request.messages[results].content[index] = json!({"type":"tool_result", "id":call["id"], "output":output, "is_error":is_error});
+            checkpoint(request)?; // Each result survives independently of the batch.
+            workspace.frontend.tool_finished(
+                tool_number,
+                name,
+                &output,
+                is_error,
+                started.elapsed(),
+            );
+        }
     }
     Err("turn limit reached; stopped without another model request".into())
 }

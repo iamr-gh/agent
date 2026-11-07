@@ -25,7 +25,7 @@ impl Drop for Fixture {
         fs::remove_dir_all(&self.0.root).unwrap();
     }
 }
-fn request() -> Request {
+pub(crate) fn request() -> Request {
     Request {
         model: "test".into(),
         messages: vec![text("user", "task".into())],
@@ -36,7 +36,7 @@ fn request() -> Request {
         options: Default::default(),
     }
 }
-fn response(content: Vec<Value>, finish: &str) -> Response {
+pub(crate) fn response(content: Vec<Value>, finish: &str) -> Response {
     Response {
         message: Message {
             role: "assistant".into(),
@@ -47,7 +47,7 @@ fn response(content: Vec<Value>, finish: &str) -> Response {
         usage: json!({}),
     }
 }
-fn call(id: &str, name: &str, arguments: Value) -> Value {
+pub(crate) fn call(id: &str, name: &str, arguments: Value) -> Value {
     json!({"type":"tool_call","id":id,"name":name,"arguments":arguments})
 }
 

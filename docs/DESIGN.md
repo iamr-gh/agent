@@ -48,4 +48,6 @@ Cancellation now uses `llm-api::Client::run_cancellable` with the signal handler
 
 A fully responsive editing/steering UI remains deferred. DNS/connect cancellation is bounded rather than immediate; arbitrary callbacks and filesystem operations cannot be forcibly interrupted, and detached shell jobs may escape process-group cleanup.
 
-Other deferred work: transcript persistence with explicit no-replay semantics for effects; prompt revisions/forks; model-aware context budgeting and explicit compaction; hierarchical instruction enforcement; stronger path traversal using anchored descriptors; and external sandboxing. None is implied by the current approval prompt or path checks.
+Saved context snapshots and `/resume`/`/reload` are implemented in `src/session.rs`; see [session representation and effect boundaries](SESSIONS.md). Persistence keeps the existing request/message representation rather than introducing a parallel transcript format.
+
+Other deferred work: prompt revisions/forks; model-aware context budgeting and explicit compaction; hierarchical instruction enforcement; stronger path traversal using anchored descriptors; and external sandboxing. None is implied by the current approval prompt or path checks.
