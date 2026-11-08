@@ -30,7 +30,7 @@ class Terminal:
         )
         os.close(slave)
         self.output = b""
-        self.expect(b"> ")
+        self.startup = self.expect(b"> ")
 
     def expect(self, text):
         deadline = time.monotonic() + 8
@@ -86,12 +86,29 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
     saved = json.loads(path.read_text())
     saved["request"]["messages"] = [
         {"role": "user", "content": [{"type": "text", "text": "saved question"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "saved answer"}],
+        {"role": "assistant", "content": [{"type": "text", "text": "🦀" * 300 + " long-text-end"}]},
+        {"role": "user", "content": [{"type": "text", "text": "middle question"}]},
+        {"role": "assistant", "content": [{"type": "tool_call", "id": "saved-call",
+          "name": "shell", "arguments": {"command": "touch must-not-exist"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "id": "saved-call",
+          "output": "saved tool output", "is_error": False}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "saved answer\u001b[31m"}],
          "replay": {"opaque": "must-survive-reload"}},
     ]
     path.write_text(json.dumps(saved))
+    def check_history(output):
+        markers = [b"saved question", ("🦀" * 300 + " long-text-end").encode(),
+                   b"middle question", b"touch must-not-exist", b"saved tool output",
+                   b"saved answer\\u{1b}[31m"]
+        positions = [output.index(marker) for marker in markers]
+        assert positions == sorted(positions)
+        assert b"\x1b[31m" not in output
+        assert b"must-survive-reload" not in output
+        assert not (workspace / "must-not-exist").exists()
+
     terminal = Terminal(binary, workspace, env, "--resume", path.stem)
     try:
+        check_history(terminal.startup)
         locked = subprocess.run([str(binary), "--resume", path.stem], cwd=workspace,
                                 env=env, capture_output=True, timeout=5)
         assert locked.returncode == 1 and b"already open" in locked.stderr
@@ -130,7 +147,7 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
         os.write(terminal.master, b"\x1b[B\x1b[A\r")
         terminal.expect(b"saved answer")
         terminal.expect(b"\r\x1b[J> ")
-        assert b"saved answer" in terminal.command("/resume " + path.stem)
+        check_history(terminal.command("/resume " + path.stem))
         # A failed exec must return to the prompt without losing the writer lock.
         parked = root / "parked"
         os.replace(binary, parked)
@@ -144,7 +161,7 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
         shutil.copy2(BINARY, replacement)
         os.replace(replacement, binary)
         pid = terminal.process.pid
-        assert b"saved answer" in terminal.command("/reload")
+        check_history(terminal.command("/reload"))
         assert terminal.process.pid == pid
         assert json.loads(path.read_text()) == saved
         assert len(list(sessions.glob("*.json"))) == 2

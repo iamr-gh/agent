@@ -363,25 +363,19 @@ fn preview(session: &Session) {
     if let Some(store) = &session.store {
         eprintln!("Session: {}", store.id);
     }
-    for message in session
-        .request
-        .messages
-        .iter()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
+    for message in &session.request.messages {
         for block in &message.content {
-            if let Some(text) = block["text"].as_str() {
-                let excerpt: String = text.chars().take(240).collect();
-                eprintln!(
-                    "{}: {}",
-                    super::display(&message.role),
-                    super::display(&excerpt)
-                );
-            }
+            // Native replay is provider context, not displayable conversation.
+            // Show every saved content block without executing any saved calls.
+            let content = block["text"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| block.to_string());
+            eprintln!(
+                "{}: {}",
+                super::display(&message.role),
+                super::display(&content)
+            );
         }
     }
 }
