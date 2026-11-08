@@ -3,7 +3,7 @@
 Sessions are saved automatically under `$AGENT_HOME/sessions` (default `~/.agent/sessions`).
 
 - `/resume` opens a quick switcher for the current canonical workspace, most recently updated first. Type to filter by the first prompt, model, or ID; use ↑/↓ to browse, Enter to resume, and Esc or Ctrl-C to cancel. Entries show the first prompt, model, relative update time, and a `(current)` marker. Choosing the current session is a no-op.
-- `/resume ID` restores one and prints the complete saved conversation in order, without message-count or text-length clipping. `agent --resume ID` does the same at launch. Text is terminal-escaped; non-text content (including tool calls/results) is shown as JSON. Opaque provider replay is retained for the model, not printed.
+- `/resume ID` restores one and prints the complete saved conversation in order, without message-count or text-length clipping. `agent --resume ID` does the same at launch. History uses the live UI: colored user prompts, Markdown answers, distinct reasoning, and compact tool summaries (`--verbose` shows tool arguments and bounded results). `NO_COLOR` uses escaped plain text. Every saved turn is included; tool details follow the same compact/verbose policy as live operation. Opaque provider replay is retained for the model, not printed. Elapsed tool times are not saved and are omitted on restore.
 - `/reload` saves and execs the executable at its startup path with `--resume ID`. Build a new executable first to load new code. This preserves the PID, current permission mode, verbosity, and budgets; it does not build automatically.
 - `/clear` starts a new saved session without deleting the old one.
 

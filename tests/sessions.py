@@ -30,7 +30,8 @@ class Terminal:
         )
         os.close(slave)
         self.output = b""
-        self.startup = self.expect(b"> ")
+        prompt = b"\r\x1b[J" + (b"" if "NO_COLOR" in env else b"\x1b[0;36m") + b"> "
+        self.startup = self.expect(prompt)
 
     def expect(self, text):
         deadline = time.monotonic() + 8
@@ -92,7 +93,9 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
           "name": "shell", "arguments": {"command": "touch must-not-exist"}}]},
         {"role": "user", "content": [{"type": "tool_result", "id": "saved-call",
           "output": "saved tool output", "is_error": False}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "saved answer\u001b[31m"}],
+        {"role": "assistant", "content": [
+            {"type": "reasoning", "text": "Saved **thinking**"},
+            {"type": "text", "text": "saved answer\u001b[31m\n**formatted answer**"}],
          "replay": {"opaque": "must-survive-reload"}},
     ]
     path.write_text(json.dumps(saved))
@@ -104,6 +107,8 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
         assert positions == sorted(positions)
         assert b"\x1b[31m" not in output
         assert b"must-survive-reload" not in output
+        assert b'"type":' not in output
+        assert b"Thinking:" in output
         assert not (workspace / "must-not-exist").exists()
 
     terminal = Terminal(binary, workspace, env, "--resume", path.stem)
@@ -171,6 +176,19 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
         assert locked.returncode == 1 and b"already open" in locked.stderr
     finally:
         terminal.close()
+    color_env = {key: value for key, value in env.items() if key != "NO_COLOR"}
+    colored = Terminal(binary, workspace, color_env, "--resume", path.stem)
+    try:
+        output = colored.startup
+        assert b"\x1b[0;36m> saved question" in output
+        assert b"\x1b[0;33m[1] $ touch must-not-exist" in output
+        assert b"formatted answer" in output and b"**formatted answer**" not in output
+        assert b"thinking" in output and b"**thinking**" not in output
+        assert b'"type":' not in output and b"must-survive-reload" not in output
+        assert not (workspace / "must-not-exist").exists()
+    finally:
+        colored.close()
+    assert json.loads(path.read_text()) == saved
     assert not list(sessions.glob(".agent-*.tmp"))
     assert "offline-test-not-a-real-key" not in path.read_text()
 print("PASS: saved context, /clear, /resume, writer lock, and /reload after executable replacement")

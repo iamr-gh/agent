@@ -198,7 +198,7 @@ fn chat_session(
     };
     let mut history = Vec::new();
     if session.store.is_some() {
-        preview(&session);
+        preview(&session, verbose);
     }
     loop {
         let input = if interactive {
@@ -280,7 +280,7 @@ fn chat_session(
                         }
                     };
                     if current == Some(id.as_str()) {
-                        preview(&session);
+                        preview(&session, verbose);
                         continue;
                     }
                     match Store::load(&root, &workspace.root, &id)
@@ -290,7 +290,7 @@ fn chat_session(
                             session = saved;
                             provider = saved_provider;
                             client = saved_client;
-                            preview(&session);
+                            preview(&session, verbose);
                         }
                         Err(error) => {
                             eprintln!("resume failed: {}", super::display(&error.to_string()))
@@ -359,23 +359,16 @@ fn chat_session(
     Ok(())
 }
 
-fn preview(session: &Session) {
+fn preview(session: &Session, verbose: bool) {
     if let Some(store) = &session.store {
         eprintln!("Session: {}", store.id);
     }
-    for message in &session.request.messages {
-        for block in &message.content {
-            // Native replay is provider context, not displayable conversation.
-            // Show every saved content block without executing any saved calls.
-            let content = block["text"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| block.to_string());
-            eprintln!(
-                "{}: {}",
-                super::display(&message.role),
-                super::display(&content)
-            );
-        }
-    }
+    eprint!(
+        "{}",
+        super::render_history(
+            &session.request.messages,
+            styles_enabled(io::stderr().is_terminal()),
+            verbose,
+        )
+    );
 }

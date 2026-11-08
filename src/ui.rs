@@ -48,16 +48,7 @@ impl Frontend for TerminalFrontend {
     }
 
     fn tool_started(&self, number: usize, name: &str, args: &Value) {
-        let label = if self.verbose {
-            format!(
-                "[{number}] {} {}",
-                display(name),
-                display(&args.to_string())
-            )
-        } else {
-            format!("[{number}] {}", label(name, args))
-        };
-        tool_activity(&label);
+        tool_activity(&tool_start(number, name, args, self.verbose));
     }
 
     fn tool_finished(
@@ -68,15 +59,10 @@ impl Frontend for TerminalFrontend {
         is_error: bool,
         elapsed: Duration,
     ) {
-        let summary = if self.verbose {
-            display(&limited(output))
-        } else {
-            format!(
-                "[{number}] {} · {:.1}s",
-                outcome(name, output, is_error),
-                elapsed.as_secs_f64()
-            )
-        };
+        let mut summary = tool_end(number, name, output, is_error, self.verbose);
+        if !self.verbose {
+            summary.push_str(&format!(" · {:.1}s", elapsed.as_secs_f64()));
+        }
         tool_activity(&summary);
     }
 
@@ -105,6 +91,97 @@ pub fn styled(text: &str, style: Style, enabled: bool) -> String {
         Style::Tool => "0;33",
     };
     format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+fn tool_start(number: usize, name: &str, args: &Value, verbose: bool) -> String {
+    if verbose {
+        format!(
+            "[{number}] {} {}",
+            display(name),
+            display(&args.to_string())
+        )
+    } else {
+        format!("[{number}] {}", label(name, args))
+    }
+}
+
+fn tool_end(number: usize, name: &str, output: &str, is_error: bool, verbose: bool) -> String {
+    if verbose {
+        display(&limited(output))
+    } else {
+        format!("[{number}] {}", outcome(name, output, is_error))
+    }
+}
+
+/// Replay presentation only, using the same renderers as live output. Native
+/// replay and tool metadata are never dumped or executed. Elapsed times are not saved.
+fn render_history(messages: &[llm_api::Message], color: bool, verbose: bool) -> String {
+    let mut output = String::new();
+    let mut calls = std::collections::HashMap::new();
+    let mut number = 0;
+    for message in messages {
+        let mut stream = StreamDisplay::new(color);
+        for block in &message.content {
+            match block["type"].as_str() {
+                Some("text" | "reasoning") if message.role == "assistant" => {
+                    output.push_str(&stream.delta(&serde_json::json!({
+                        "type": if block["type"] == "reasoning" { "reasoning_delta" } else { "text_delta" },
+                        "delta": block["text"],
+                    })));
+                }
+                Some("text") => {
+                    output.push_str(&stream.finish());
+                    output.push('\n');
+                    output.push_str(&styled(
+                        &format!("> {}", display(block["text"].as_str().unwrap_or(""))),
+                        Style::Input,
+                        color,
+                    ));
+                    output.push('\n');
+                    number = 0;
+                }
+                Some("tool_call") => {
+                    output.push_str(&stream.finish());
+                    number += 1;
+                    let name = block["name"].as_str().unwrap_or("unknown");
+                    calls.insert(block["id"].as_str().unwrap_or(""), (number, name));
+                    output.push_str(&styled(
+                        &tool_start(number, name, &block["arguments"], verbose),
+                        Style::Tool,
+                        color,
+                    ));
+                    output.push('\n');
+                }
+                Some("tool_result") => {
+                    output.push_str(&stream.finish());
+                    let (number, name) = calls
+                        .get(block["id"].as_str().unwrap_or(""))
+                        .copied()
+                        .unwrap_or((0, "unknown"));
+                    let raw = &block["output"];
+                    let text = raw
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| raw.to_string());
+                    output.push_str(&styled(
+                        &tool_end(
+                            number,
+                            name,
+                            &text,
+                            block["is_error"].as_bool().unwrap_or(false),
+                            verbose,
+                        ),
+                        Style::Tool,
+                        color,
+                    ));
+                    output.push('\n');
+                }
+                _ => {} // Opaque/unsupported blocks are not terminal output.
+            }
+        }
+        output.push_str(&stream.finish());
+    }
+    output
 }
 
 pub fn tool_activity(text: &str) {
@@ -269,6 +346,56 @@ impl StreamDisplay {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn restored_history_uses_live_renderers_without_dumping_metadata() {
+        let messages = vec![
+            crate::engine::text("user", "**question**\u{1b}[31m".into()),
+            llm_api::Message {
+                role: "assistant".into(),
+                content: vec![
+                    json!({"type":"reasoning", "text":"Consider **carefully**"}),
+                    json!({"type":"text", "text":"A **bold** answer"}),
+                    json!({"type":"tool_call", "id":"hidden-id", "name":"read_file", "arguments":{"path":"a.rs"}}),
+                ],
+                replay: Some(json!({"secret":"opaque-replay"})),
+            },
+            llm_api::Message {
+                role: "user".into(),
+                content: vec![
+                    json!({"type":"tool_result", "id":"hidden-id", "output":"file-body", "is_error":false}),
+                ],
+                replay: None,
+            },
+        ];
+        for color in [false, true] {
+            let rendered = render_history(&messages, color, false);
+            let mut stream = StreamDisplay::new(color);
+            let expected = stream
+                .delta(&json!({"type":"reasoning_delta", "delta":"Consider **carefully**"}))
+                + &stream.delta(&json!({"type":"text_delta", "delta":"A **bold** answer"}))
+                + &stream.finish();
+            assert!(rendered.contains(&expected));
+            assert!(rendered.contains(&styled("> **question**\\u{1b}[31m", Style::Input, color)));
+            assert!(rendered.contains(&styled(
+                &tool_start(1, "read_file", &json!({"path":"a.rs"}), false),
+                Style::Tool,
+                color
+            )));
+            assert!(rendered.contains("[1] done · 1 lines, 9 bytes"));
+            for hidden in [
+                "hidden-id",
+                "opaque-replay",
+                "file-body",
+                "tool_call",
+                "tool_result",
+                "\u{1b}[31m",
+            ] {
+                assert!(!rendered.contains(hidden), "{hidden}: {rendered}");
+            }
+            assert!(render_history(&messages, color, true).contains("file-body"));
+        }
+    }
 
     #[test]
     fn roles_have_distinct_styles_and_plain_output_is_unchanged() {
