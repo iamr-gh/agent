@@ -67,7 +67,7 @@ pub(crate) fn run() -> Result<()> {
             std::env::var("AGENT_PROVIDER").unwrap_or("codex".into())
         ))?;
         let mut request = Request {
-            model: std::env::var("AGENT_MODEL").unwrap_or("gpt-6.1-sol".into()),
+            model: std::env::var("AGENT_MODEL").unwrap_or(crate::models::DEFAULT_MODEL.into()),
             messages: Vec::new(),
             system: format!(
                 "{}\nWorkspace: {}",

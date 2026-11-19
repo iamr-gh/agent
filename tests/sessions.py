@@ -16,15 +16,16 @@ BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/ag").resolve
 
 
 class Terminal:
-    def __init__(self, binary, workspace, env, *args):
+    def __init__(self, binary, workspace, env, *args, model="test"):
         self.master, slave = pty.openpty()
 
         def setup():
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
+        model_args = [] if model is None else ["--model", model]
         self.process = subprocess.Popen(
-            [str(binary), "--provider", "openai", "--model", "test", "--ask", *args],
+            [str(binary), "--provider", "openai", *model_args, "--ask", *args],
             cwd=workspace, env=env, stdin=slave, stdout=slave, stderr=slave,
             preexec_fn=setup,
         )
@@ -215,7 +216,20 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
     finally:
         selector.close()
     codex_env = dict(env, CODEX_ACCESS_TOKEN="offline-test-not-a-real-token",
-                     CODEX_ACCOUNT_ID="offline-test-account")
+                     CODEX_ACCOUNT_ID="offline-test-account", AGENT_MODEL_DISCOVERY="off")
+    default_env = dict(codex_env)
+    default_env.pop("AGENT_MODEL", None)
+    default = Terminal(binary, workspace, default_env, "--provider", "codex", model=None)
+    try:
+        assert b"Model: gpt-6.2-sol" in default.startup
+    finally:
+        default.close()
+    override = Terminal(binary, workspace, dict(codex_env, AGENT_MODEL="custom-env-model"),
+                        "--provider", "codex", model=None)
+    try:
+        assert b"Model: custom-env-model" in override.startup
+    finally:
+        override.close()
     codex = Terminal(binary, workspace, codex_env,
                      "--provider", "codex", "--model", "gpt-6.1-sol")
     try:

@@ -1,6 +1,7 @@
 mod auth;
 mod discord;
 mod engine;
+mod models;
 mod session;
 mod skills;
 mod ui;

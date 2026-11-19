@@ -140,12 +140,23 @@ impl Drop for Screen {
 }
 
 pub(super) fn choose_model(provider: llm_api::Provider, current: &str) -> Result<Option<String>> {
+    if provider == llm_api::Provider::Codex {
+        crate::models::start();
+    }
     choose_entries(&model_entries(provider, current), Some(current), true)
 }
 
 fn model_entries(provider: llm_api::Provider, current: &str) -> Vec<Summary> {
-    // Suggestions only: availability depends on the provider/account. Custom IDs
-    // remain available through /model ID; opening the picker makes no API calls.
+    model_entries_with(provider, current, crate::models::discovered())
+}
+
+fn model_entries_with(
+    provider: llm_api::Provider,
+    current: &str,
+    discovered: Option<Vec<String>>,
+) -> Vec<Summary> {
+    // Discovery is a nonblocking snapshot; built-ins remain the offline fallback.
+    // Custom IDs remain available through /model ID.
     let suggestions: &[&str] = match provider {
         // Matched against `fx models --json` (Codex subscription). These are not
         // OpenAI API model IDs; keep them scoped to the Codex provider.
@@ -165,6 +176,15 @@ fn model_entries(provider: llm_api::Provider, current: &str) -> Vec<Summary> {
         llm_api::Provider::Anthropic => &["claude-sonnet-4-5", "claude-opus-4-1"],
         llm_api::Provider::Openrouter => &["openai/gpt-5", "anthropic/claude-sonnet-4.5"],
     };
+    let discovered = if provider == llm_api::Provider::Codex {
+        discovered
+    } else {
+        None
+    };
+    let suggestions: Vec<&str> = discovered
+        .as_ref()
+        .map(|ids| ids.iter().map(String::as_str).collect())
+        .unwrap_or_else(|| suggestions.to_vec());
     let mut entries = Vec::new();
     for id in std::iter::once(current).chain(suggestions.iter().copied()) {
         if entries.iter().any(|entry: &Summary| entry.id == id) {
@@ -305,6 +325,21 @@ fn choose_entries(
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    #[test]
+    fn live_catalog_replaces_fallback_without_losing_current_or_crossing_providers() {
+        let live = Some(vec![
+            "gpt-future".into(),
+            "gpt-current".into(),
+            "gpt-future".into(),
+        ]);
+        let entries = model_entries_with(llm_api::Provider::Codex, "gpt-current", live.clone());
+        let ids: Vec<_> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, ["gpt-current", "gpt-future"]);
+        let entries = model_entries_with(llm_api::Provider::Openai, "custom", live);
+        assert!(!entries.iter().any(|entry| entry.id == "gpt-future"));
+        assert!(entries.iter().any(|entry| entry.id == "gpt-5-mini"));
+    }
 
     #[test]
     fn codex_catalog_includes_latest_models_and_keeps_current_once() {

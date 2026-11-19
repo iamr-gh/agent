@@ -8,9 +8,33 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn codex_client() -> Result<Client> {
+    let credentials = codex_credentials()?;
+    Client::codex(credentials.token, credentials.account)
+}
+
+pub(crate) struct CodexCredentials {
+    pub token: String,
+    pub account: String,
+}
+
+impl CodexCredentials {
+    fn new(token: String, account: String) -> Result<Self> {
+        // Validate without constructing an extra HTTP client on the startup path.
+        if token.is_empty()
+            || account.is_empty()
+            || account.len() > 1024
+            || !account.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err("Codex requires an access token and printable account ID".into());
+        }
+        Ok(Self { token, account })
+    }
+}
+
+pub(crate) fn codex_credentials() -> Result<CodexCredentials> {
     use std::env::{VarError, var, var_os};
     match (var("CODEX_ACCESS_TOKEN"), var("CODEX_ACCOUNT_ID")) {
-        (Ok(token), Ok(account)) => return Client::codex(token, account),
+        (Ok(token), Ok(account)) => return CodexCredentials::new(token, account),
         (Err(VarError::NotPresent), Err(VarError::NotPresent)) => {}
         _ => return Err("set both CODEX_ACCESS_TOKEN and CODEX_ACCOUNT_ID, or neither".into()),
     }
@@ -31,7 +55,7 @@ pub fn codex_client() -> Result<Client> {
     from_file(&legacy).map_err(|e| format!("Codex login unavailable: {e}. Set both CODEX environment variables or renew the existing fx login").into())
 }
 
-fn from_file(path: &Path) -> Result<Client> {
+fn from_file(path: &Path) -> Result<CodexCredentials> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -56,13 +80,15 @@ fn from_file(path: &Path) -> Result<Client> {
             "Codex access token expired or near expiry; refresh it through its login owner".into(),
         );
     }
-    Client::codex(
+    CodexCredentials::new(
         data["access_token"]
             .as_str()
-            .ok_or("missing Codex access token")?,
+            .ok_or("missing Codex access token")?
+            .into(),
         data["account_id"]
             .as_str()
-            .ok_or("missing Codex account ID")?,
+            .ok_or("missing Codex account ID")?
+            .into(),
     )
 }
 

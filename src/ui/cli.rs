@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 pub(crate) fn run() -> Result<()> {
     let mut provider = std::env::var("AGENT_PROVIDER").unwrap_or("codex".into());
-    let mut model = std::env::var("AGENT_MODEL").unwrap_or("gpt-6.1-sol".into());
+    let mut model = std::env::var("AGENT_MODEL").unwrap_or(crate::models::DEFAULT_MODEL.into());
     let mut yes = true;
     let mut verbose = false;
     let mut max_turns = 500;
@@ -50,7 +50,7 @@ pub(crate) fn run() -> Result<()> {
                     "Interactive terminal: type in the live input area while the agent works; Enter queues a follow-up for after the current turn. Ctrl-C cancels and discards pending input."
                 );
                 println!(
-                    "ag [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/model opens a searchable model picker; /model ID selects a custom model for the current provider. Switching starts a new saved session; availability depends on your account.\n/resume opens a searchable session picker (↑/↓, Enter, Esc); /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
+                    "ag [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.2-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/model opens a searchable model picker; /model ID selects a custom model for the current provider. Switching starts a new saved session; availability depends on your account.\n/resume opens a searchable session picker (↑/↓, Enter, Esc); /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
                 );
                 return Ok(());
             }
@@ -194,6 +194,9 @@ fn chat_session(
     // Keep noncanonical, no-echo input active during model/tool output too.
     // Otherwise the terminal line discipline edits or discards typeahead before
     // the prompt editor can see it. No reader competes with the prompt editor.
+    if interactive && provider == Provider::Codex {
+        crate::models::start();
+    }
     let mut terminal = if interactive {
         Some(input::Terminal::enter()?)
     } else {

@@ -12,6 +12,7 @@ dependencies = [
  "termimad",
  "unicode-segmentation",
  "unicode-width 0.2.3",
+ "ureq",
 ]
 
 [[package]]
