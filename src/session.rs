@@ -176,6 +176,33 @@ impl Store {
 }
 
 impl Session {
+    // Replay envelopes belong to the original model. Leave the old snapshot
+    // intact and start fresh, committing the in-memory switch only after save.
+    pub fn switch_model(&mut self, model: &str, provider: Provider) -> Result<bool> {
+        if model.is_empty()
+            || model.chars().any(char::is_whitespace)
+            || model.chars().any(char::is_control)
+        {
+            return Err(
+                "model ID must be nonempty and contain no whitespace or control characters".into(),
+            );
+        }
+        if self.request.model == model {
+            return Ok(false);
+        }
+        let mut request = self.request.clone();
+        request.model = model.into();
+        request.messages.clear();
+        let store = self
+            .store
+            .as_ref()
+            .map(|store| Store::create(&store.root, &store.workspace, provider, &request))
+            .transpose()?;
+        self.request = request;
+        self.store = store;
+        Ok(true)
+    }
+
     pub fn save(&self, active: bool) -> Result<()> {
         if let Some(store) = &self.store {
             store.save(&self.request, active)?;
@@ -192,6 +219,43 @@ mod tests {
         tests::{Fixture, call, request, response},
     };
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn model_switch_preserves_old_snapshot_and_resumes_new_model() {
+        let f = Fixture::new();
+        let root = root(&f);
+        let mut request = request();
+        request.messages = vec![text("user", "old conversation".into())];
+        let original_model = request.model.clone();
+        let store = Store::create(&root, &f.0.root, Provider::Openai, &request).unwrap();
+        let old_id = store.id.clone();
+        let mut session = Session {
+            request,
+            store: Some(store),
+        };
+        assert!(
+            !session
+                .switch_model(&original_model, Provider::Openai)
+                .unwrap()
+        );
+        assert!(session.switch_model("bad model", Provider::Openai).is_err());
+        assert_eq!(session.store.as_ref().unwrap().id, old_id);
+        assert!(
+            session
+                .switch_model("custom-model", Provider::Openai)
+                .unwrap()
+        );
+        assert!(session.request.messages.is_empty());
+        let new_id = session.store.as_ref().unwrap().id.clone();
+        assert_ne!(old_id, new_id);
+        drop(session);
+        let (old, _) = Store::load(&root, &f.0.root, &old_id).unwrap();
+        assert_eq!(old.request.model, original_model);
+        assert_eq!(old.request.messages.len(), 1);
+        let (new, _) = Store::load(&root, &f.0.root, &new_id).unwrap();
+        assert_eq!(new.request.model, "custom-model");
+        assert!(new.request.messages.is_empty());
+    }
 
     fn root(f: &Fixture) -> PathBuf {
         let root = f.0.root.join("sessions");

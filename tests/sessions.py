@@ -189,6 +189,51 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
     finally:
         colored.close()
     assert json.loads(path.read_text()) == saved
+    selector = Terminal(binary, workspace, env, "--resume", path.stem)
+    try:
+        selector.send("/model")
+        selector.expect(b"Model > ")
+        selector.expect(b"(current) test")
+        selector.expect(b"Esc cancel")
+        os.write(selector.master, b"\x1b")
+        selector.expect(b"\r\x1b[J> ")
+        assert json.loads(path.read_text()) == saved
+        selector.send("/model")
+        selector.expect(b"Esc cancel")
+        os.write(selector.master, b"gpt-5-mini\r")
+        selector.expect(b"Model: gpt-5-mini (new session")
+        selector.expect(b"\r\x1b[J> ")
+        assert b"unchanged" in selector.command("/model gpt-5-mini")
+        assert b"model selection failed" in selector.command("/model bad id")
+        assert b"Model: custom-model" in selector.command("/model custom-model")
+        switched = [json.loads(p.read_text()) for p in sessions.glob("*.json")]
+        custom = next(s for s in switched if s["request"]["model"] == "custom-model")
+        assert custom["request"]["messages"] == []
+        assert custom["provider"] == "openai"
+        assert json.loads(path.read_text()) == saved
+        assert b"Model: custom-model" in selector.command("/reload")
+    finally:
+        selector.close()
+    codex_env = dict(env, CODEX_ACCESS_TOKEN="offline-test-not-a-real-token",
+                     CODEX_ACCOUNT_ID="offline-test-account")
+    codex = Terminal(binary, workspace, codex_env,
+                     "--provider", "codex", "--model", "gpt-6.1-sol")
+    try:
+        for model in ("gpt-6.2-sol", "gpt-6.2-astra"):
+            codex.send("/model")
+            codex.expect(b"Model > ")
+            codex.expect(b"Esc cancel")
+            os.write(codex.master, model.encode())
+            codex.expect(b"(1 models)")
+            os.write(codex.master, b"\r")
+            codex.expect(f"Model: {model} (new session".encode())
+            codex.expect(b"\r\x1b[J> ")
+            snapshots = [json.loads(p.read_text()) for p in sessions.glob("*.json")]
+            selected = next(s for s in snapshots if s["request"]["model"] == model)
+            assert selected["provider"] == "codex"
+            assert selected["request"]["messages"] == []
+    finally:
+        codex.close()
     assert not list(sessions.glob(".agent-*.tmp"))
     assert "offline-test-not-a-real-key" not in path.read_text()
 print("PASS: saved context, /clear, /resume, writer lock, and /reload after executable replacement")

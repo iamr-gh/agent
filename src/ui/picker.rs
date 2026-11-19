@@ -1,4 +1,4 @@
-//! Searchable, workspace-local session switcher. No model calls or tool replay.
+//! Searchable session and model selectors. No model calls or tool replay.
 use super::{display, input};
 use crate::{Result, check_interrupt, session::Summary};
 use std::io::{self, Write};
@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 struct Picker<'a> {
     entries: &'a [Summary],
+    models: bool,
     query: String,
     selected: usize,
 }
@@ -41,9 +42,11 @@ impl Picker<'_> {
         let capacity = size.1.saturating_sub(3).max(1);
         let start = self.selected.saturating_sub(capacity - 1);
         let mut rows = vec![format!(
-            "Resume > {}  ({} sessions)",
+            "{} > {}  ({} {})",
+            if self.models { "Model" } else { "Resume" },
             self.query,
-            matches.len()
+            matches.len(),
+            if self.models { "models" } else { "sessions" }
         )];
         for (position, &index) in matches.iter().enumerate().skip(start).take(capacity) {
             let entry = &self.entries[index];
@@ -57,6 +60,19 @@ impl Picker<'_> {
             } else {
                 format!("{}d ago", age / 86400)
             };
+            if self.models {
+                rows.push(format!(
+                    "{} {}{}",
+                    if position == self.selected { ">" } else { " " },
+                    if current == Some(entry.id.as_str()) {
+                        "(current) "
+                    } else {
+                        ""
+                    },
+                    entry.id,
+                ));
+                continue;
+            }
             rows.push(format!(
                 "{} {}{}  [{} · {}]",
                 if position == self.selected { ">" } else { " " },
@@ -74,7 +90,10 @@ impl Picker<'_> {
             rows.push("  No matching sessions".into());
         }
         if size.1 > 3 {
-            rows.push("↑/↓ select · type to filter · Enter resume · Esc cancel".into());
+            rows.push(format!(
+                "↑/↓ select · type to filter · Enter {} · Esc cancel",
+                if self.models { "select" } else { "resume" }
+            ));
         }
         rows.into_iter()
             .take(size.1.saturating_sub(1).max(1))
@@ -120,7 +139,56 @@ impl Drop for Screen {
     }
 }
 
+pub(super) fn choose_model(provider: llm_api::Provider, current: &str) -> Result<Option<String>> {
+    choose_entries(&model_entries(provider, current), Some(current), true)
+}
+
+fn model_entries(provider: llm_api::Provider, current: &str) -> Vec<Summary> {
+    // Suggestions only: availability depends on the provider/account. Custom IDs
+    // remain available through /model ID; opening the picker makes no API calls.
+    let suggestions: &[&str] = match provider {
+        // Matched against `fx models --json` (Codex subscription). These are not
+        // OpenAI API model IDs; keep them scoped to the Codex provider.
+        llm_api::Provider::Codex => &[
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-terra",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ],
+        llm_api::Provider::Openai => &["gpt-5", "gpt-5-mini", "gpt-4.1"],
+        llm_api::Provider::Anthropic => &["claude-sonnet-4-5", "claude-opus-4-1"],
+        llm_api::Provider::Openrouter => &["openai/gpt-5", "anthropic/claude-sonnet-4.5"],
+    };
+    let mut entries = Vec::new();
+    for id in std::iter::once(current).chain(suggestions.iter().copied()) {
+        if entries.iter().any(|entry: &Summary| entry.id == id) {
+            continue;
+        }
+        entries.push(Summary {
+            id: id.into(),
+            title: id.into(),
+            model: id.into(),
+            modified: std::time::SystemTime::now(),
+        });
+    }
+    entries
+}
+
 pub(super) fn choose(entries: &[Summary], current: Option<&str>) -> Result<Option<String>> {
+    choose_entries(entries, current, false)
+}
+
+fn choose_entries(
+    entries: &[Summary],
+    current: Option<&str>,
+    models: bool,
+) -> Result<Option<String>> {
     if entries.is_empty() {
         eprintln!("No saved sessions for this workspace.");
         return Ok(None);
@@ -129,6 +197,7 @@ pub(super) fn choose(entries: &[Summary], current: Option<&str>) -> Result<Optio
     let mut screen = Screen(io::stderr());
     let mut picker = Picker {
         entries,
+        models,
         query: String::new(),
         selected: 0,
     };
@@ -238,6 +307,53 @@ mod tests {
     use std::time::SystemTime;
 
     #[test]
+    fn codex_catalog_includes_latest_models_and_keeps_current_once() {
+        let entries = model_entries(llm_api::Provider::Codex, "gpt-6.1-sol");
+        let ids: Vec<_> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gpt-6.1-sol",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+                "gpt-6.1-terra",
+                "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ]
+        );
+        let picker = Picker {
+            entries: &entries,
+            models: true,
+            query: "GPT-6.2".into(),
+            selected: 0,
+        };
+        assert_eq!(picker.matches(), [1, 2]);
+        let rows = picker.rows(Some("gpt-6.1-sol"), (100, 24));
+        assert!(rows[1].contains("gpt-6.2-sol"));
+        assert!(rows[2].contains("gpt-6.2-astra"));
+    }
+
+    #[test]
+    fn model_catalog_preserves_custom_current_and_provider_boundaries() {
+        let entries = model_entries(llm_api::Provider::Codex, "custom-model");
+        assert_eq!(entries[0].id, "custom-model");
+        assert_eq!(entries.len(), 11);
+        for provider in [
+            llm_api::Provider::Openai,
+            llm_api::Provider::Anthropic,
+            llm_api::Provider::Openrouter,
+        ] {
+            let entries = model_entries(provider, "custom-model");
+            assert_eq!(entries[0].id, "custom-model");
+            assert!(!entries.iter().any(|entry| entry.id == "gpt-6.2-sol"));
+        }
+    }
+
+    #[test]
     fn search_navigation_and_safe_bounded_rows() {
         let entries = [
             Summary {
@@ -255,6 +371,7 @@ mod tests {
         ];
         let mut picker = Picker {
             entries: &entries,
+            models: false,
             query: String::new(),
             selected: 0,
         };

@@ -47,7 +47,7 @@ pub(crate) fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "ag [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/resume opens a searchable session picker (↑/↓, Enter, Esc); /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
+                    "ag [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/model opens a searchable model picker; /model ID selects a custom model for the current provider. Switching starts a new saved session; availability depends on your account.\n/resume opens a searchable session picker (↑/↓, Enter, Esc); /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
                 );
                 return Ok(());
             }
@@ -229,6 +229,41 @@ fn chat_session(
                     }
                     continue;
                 }
+                command if command == "/model" || command.starts_with("/model ") => {
+                    let selected = if command == "/model" {
+                        super::picker::choose_model(provider, &session.request.model)
+                    } else {
+                        Ok(Some(
+                            command.trim_start_matches("/model ").trim().to_owned(),
+                        ))
+                    };
+                    match selected.and_then(|model| {
+                        model
+                            .map(|model| session.switch_model(&model, provider))
+                            .transpose()
+                    }) {
+                        Ok(Some(changed)) => {
+                            eprintln!(
+                                "Model: {}{}",
+                                super::display(&session.request.model),
+                                if changed {
+                                    " (new session; previous conversation saved)"
+                                } else {
+                                    " (unchanged)"
+                                }
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) if e.is::<llm_api::Cancelled>() => {
+                            INTERRUPTED.store(false, Ordering::Relaxed);
+                        }
+                        Err(error) => eprintln!(
+                            "model selection failed: {}",
+                            super::display(&error.to_string())
+                        ),
+                    }
+                    continue;
+                }
                 "/reload" => {
                     session.save(false)?;
                     if let Some(store) = &session.store {
@@ -363,6 +398,7 @@ fn preview(session: &Session, verbose: bool) {
     if let Some(store) = &session.store {
         eprintln!("Session: {}", store.id);
     }
+    eprintln!("Model: {}", super::display(&session.request.model));
     eprint!(
         "{}",
         super::render_history(
