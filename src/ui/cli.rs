@@ -1,5 +1,5 @@
 //! CLI configuration and terminal conversation controller.
-use super::{StreamDisplay, TerminalFrontend, input, styles_enabled};
+use super::{StreamDisplay, TerminalFrontend, input, live, styles_enabled};
 use crate::{
     INTERRUPTED, Workspace, auth, check_interrupt,
     engine::{text, tools, turn_saved},
@@ -8,7 +8,7 @@ use crate::{
 };
 use llm_api::{Client, Provider, Request, Result};
 use serde_json::json;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::sync::atomic::Ordering;
 
 pub(crate) fn run() -> Result<()> {
@@ -46,6 +46,9 @@ pub(crate) fn run() -> Result<()> {
                     .parse()?
             }
             "--help" | "-h" => {
+                println!(
+                    "Interactive terminal: type in the live input area while the agent works; Enter queues a follow-up for after the current turn. Ctrl-C cancels and discards pending input."
+                );
                 println!(
                     "ag [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.1-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/model opens a searchable model picker; /model ID selects a custom model for the current provider. Switching starts a new saved session; availability depends on your account.\n/resume opens a searchable session picker (↑/↓, Enter, Esc); /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
                 );
@@ -196,14 +199,14 @@ fn chat_session(
     } else {
         None
     };
-    let mut history = Vec::new();
+    let mut typing = live::Typing::default();
     if session.store.is_some() {
         preview(&session, verbose);
     }
     loop {
         let input = if interactive {
             eprintln!();
-            let input = match input::read_line_with_history("> ", &mut history) {
+            let input = match typing.read_line() {
                 Ok(input) => input,
                 Err(e) if e.is::<llm_api::Cancelled>() => {
                     INTERRUPTED.store(false, Ordering::Relaxed);
@@ -343,6 +346,7 @@ fn chat_session(
         session.save(true)?;
         let store = &session.store;
         let mut checkpoint_failed = false;
+        let busy = if interactive { typing.busy()? } else { None };
         let result = turn_saved(
             &mut session.request,
             &workspace,
@@ -357,13 +361,11 @@ fn chat_session(
                     }
                     let chunk = stream.delta(&event);
                     if !chunk.is_empty() {
-                        print!("{chunk}");
-                        return io::stdout().flush().is_ok();
+                        return live::output(&chunk, false).is_ok();
                     }
                     true
                 });
-                print!("{}", stream.finish());
-                io::stdout().flush()?;
+                live::output(&stream.finish(), false)?;
                 result
             },
             |request| {
@@ -376,6 +378,9 @@ fn chat_session(
                 Ok(())
             },
         );
+        if let Some(busy) = busy {
+            busy.finish(&mut typing)?;
+        }
         if checkpoint_failed {
             return result;
         }

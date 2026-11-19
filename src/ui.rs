@@ -1,6 +1,7 @@
 //! Terminal frontend. Escaping, styling, prompts and input stay out of the engine.
 mod cli;
 mod input;
+mod live;
 mod picker;
 use crate::engine::{Frontend, check_interrupt, limited};
 #[cfg(test)]
@@ -31,20 +32,22 @@ pub(crate) struct TerminalFrontend {
 
 impl Frontend for TerminalFrontend {
     fn approve(&self, name: &str, args: &Value) -> Result<()> {
-        // Approval always exposes the full proposed effect, even in compact mode.
-        eprintln!("\n{} {}", display(name), display(&args.to_string()));
-        if !io::stdin().is_terminal() {
-            return Err(
-                "approval requires a terminal; omit --ask or pass --yes to allow automatically"
-                    .into(),
-            );
-        }
-        let answer = input::read_line("Allow with full user privileges? [y/N] ")?;
-        check_interrupt()?;
-        if answer.trim() != "y" {
-            return Err("denied by user".into());
-        }
-        Ok(())
+        live::suspend(|| {
+            // Approval always exposes the full proposed effect, even in compact mode.
+            eprintln!("\n{} {}", display(name), display(&args.to_string()));
+            if !io::stdin().is_terminal() {
+                return Err(
+                    "approval requires a terminal; omit --ask or pass --yes to allow automatically"
+                        .into(),
+                );
+            }
+            let answer = input::read_line("Allow with full user privileges? [y/N] ")?;
+            check_interrupt()?;
+            if answer.trim() != "y" {
+                return Err("denied by user".into());
+            }
+            Ok(())
+        })
     }
 
     fn tool_started(&self, number: usize, name: &str, args: &Value) {
@@ -67,7 +70,7 @@ impl Frontend for TerminalFrontend {
     }
 
     fn diagnostic(&self, message: &str) {
-        eprintln!("skills: {}", display(message));
+        let _ = live::output(&format!("skills: {}\n", display(message)), true);
     }
 }
 
@@ -185,13 +188,16 @@ fn render_history(messages: &[llm_api::Message], color: bool, verbose: bool) -> 
 }
 
 pub fn tool_activity(text: &str) {
-    eprintln!(
-        "{}",
-        styled(
-            text,
-            Style::Tool,
-            styles_enabled(io::stderr().is_terminal())
-        )
+    let _ = live::output(
+        &format!(
+            "{}\n",
+            styled(
+                text,
+                Style::Tool,
+                styles_enabled(io::stderr().is_terminal())
+            )
+        ),
+        true,
     );
 }
 

@@ -16,6 +16,7 @@ This document describes the current application. See [saved sessions](SESSIONS.m
 | `src/ui.rs` | Terminal frontend, approval prompts, tool summaries, and model-output rendering |
 | `src/ui/cli.rs` | CLI options, interactive commands, resume, and reload |
 | `src/ui/input.rs` | Unicode-aware input editing, history, and terminal mode management |
+| `src/ui/live.rs` | Live busy-turn input area, queued follow-ups, and synchronized terminal output |
 | `src/ui/picker.rs` | Searchable workspace session switcher |
 
 The engine has no terminal I/O or presentation dependency. Its `Frontend` interface receives tool activity, diagnostics, and approval requests; inference is supplied as a callback. This lets tests exercise the engine without a terminal. These are in-process module boundaries, not a client/server protocol.
@@ -58,7 +59,9 @@ On a styled terminal, `termimad` renders buffered Markdown for answers and reaso
 
 Tool output is compact by default; `--verbose` shows full arguments and bounded results. Untrusted control characters are escaped before presentation. The session picker additionally flattens whitespace and clips entries by display width.
 
-Interactive chat keeps the controlling terminal in noncanonical, no-echo mode during both input and model/tool output, leaving typeahead available for the next prompt. Input uses nonblocking byte reads and `select` with a 25 ms timeout for interruption and resize checks. Terminal settings are restored on exit and before reload.
+Interactive chat keeps the controlling terminal in noncanonical, no-echo mode during both input and model/tool output. While the agent works, a visible input area at the bottom of the terminal supports the same editing keys as the idle prompt. Enter queues a follow-up; queued messages (including slash commands) are handled in submission order after the current turn finishes, never injected into an active model request or tool batch. An unfinished draft and its cursor survive the transition back to the idle prompt and through queued turns. Ctrl-C cancels the active turn and discards pending queued input and the draft. Queued input is in memory only, not saved until submitted to the conversation.
+
+The busy-turn reader polls nonblocking input every 16 ms. Model and tool output share a synchronized scrolling region above the input area. Approval prompts temporarily suspend the reader and restore normal output; already queued input and the live draft cannot answer an approval. Idle input uses `select` with a 25 ms timeout for interruption and resize checks. Redirected output and terminals shorter than five rows at turn start retain the ordinary typeahead behavior without the live area. Terminal settings and the full scrolling region are restored on exit and before reload.
 
 The editor supports grapheme-aware left/right movement, Home/End, Delete/Backspace, and Up/Down navigation through in-memory submitted-input history. Moving past the newest history entry restores the unfinished draft. Wrapped input scrolls to keep the cursor visible. Approval prompts have separate disposable history. Prompt history is not persisted across restarts or reloads; saved conversation context is.
 

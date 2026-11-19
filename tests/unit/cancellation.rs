@@ -146,6 +146,26 @@ impl Process {
         }
     }
 
+    fn resize(&mut self, rows: u16, columns: u16) {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: the owned PTY descriptor is live and ioctl borrows size.
+        assert_eq!(
+            unsafe {
+                libc::ioctl(
+                    self.terminal.as_ref().unwrap().as_raw_fd(),
+                    libc::TIOCSWINSZ,
+                    &size,
+                )
+            },
+            0
+        );
+    }
+
     fn send(&mut self, input: &str) {
         self.terminal
             .as_mut()
@@ -163,6 +183,8 @@ impl Process {
                     thread::sleep(Duration::from_millis(2));
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // A queued /quit can exit before this drain window ends.
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
                 Err(e) => panic!("terminal read: {e}"),
             }
         }
@@ -434,6 +456,9 @@ fn input_typed_during_response_survives_until_the_next_prompt() {
     let (stream, _) = server.request();
     // Queue an unfinished line while the model request is still running.
     process.send("queued ac\x1b[Db");
+    // The draft must be visible before the stalled request returns, not just
+    // preserved invisibly as terminal typeahead.
+    process.expect("queued abc");
     done(stream);
     process.expect("queued abc");
     process.send("\n");
@@ -447,6 +472,91 @@ fn input_typed_during_response_survives_until_the_next_prompt() {
     done(stream);
     process.expect("> ");
     process.quit();
+}
+
+#[test]
+fn live_queue_is_fifo_and_unfinished_draft_survives_busy_turns() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    process.send("first\n");
+    let (stream, _) = server.request();
+    process.send("second\nthird\n界e\u{301} ac\x1b[Db");
+    process.expect("Enter: queue (2)");
+    process.expect("界e\u{301} abc");
+    assert!(matches!(server.0.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    done(stream);
+    let (stream, body) = server.request();
+    assert_user_text(&body, "second\n");
+    done(stream);
+    let (stream, body) = server.request();
+    assert_user_text(&body, "third\n");
+    done(stream);
+    process.expect("界e\u{301} abc");
+    // Cursor was between b and c, not at the end, throughout both queued turns.
+    process.send("X\n");
+    let (stream, body) = server.request();
+    assert_user_text(&body, "界e\u{301} abXc\n");
+    done(stream);
+    process.expect("> ");
+    process.quit();
+}
+
+#[test]
+fn live_input_survives_narrow_and_short_terminal_resizes() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    process.send("first\n");
+    let (stream, _) = server.request();
+    process.send("live 界e\u{301}🙂");
+    process.expect("live 界e\u{301}🙂");
+    process.resize(8, 2);
+    process.expect("\x1b[1;5r");
+    process.resize(2, 2);
+    process.expect("\x1b[r\x1b[2;1H");
+    process.resize(12, 80);
+    process.expect("live 界e\u{301}🙂");
+    process.send("\n");
+    done(stream);
+    let (stream, body) = server.request();
+    assert_user_text(&body, "live 界e\u{301}🙂\n");
+    done(stream);
+    process.expect("> ");
+    process.quit();
+}
+
+#[test]
+fn live_typeahead_cannot_answer_an_approval_and_draft_is_restored() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, true);
+    process.expect("> ");
+    process.send("first\n");
+    let (stream, _) = server.request();
+    process.send("y\nunfinished draft");
+    process.expect("Enter: queue (1)");
+    process.expect("unfinished draft");
+    tool(
+        stream,
+        "write_file",
+        json!({"path":"must-not-exist", "content":"bad"}),
+    );
+    process.expect("Allow with full user privileges? [y/N] ");
+    assert!(!fixture.0.root.join("must-not-exist").exists());
+    process.send("n\n");
+    let (stream, _) = server.request();
+    process.expect("unfinished draft");
+    assert!(!fixture.0.root.join("must-not-exist").exists());
+    done(stream);
+    let (stream, body) = server.request();
+    assert_user_text(&body, "y\n");
+    done(stream);
+    process.expect("unfinished draft");
+    process.send("\x15/quit\n");
+    assert_eq!(process.wait().code(), Some(0));
 }
 
 #[test]
@@ -580,6 +690,8 @@ fn shell_interrupt_cleans_group_and_preserves_tool_result() {
     complete(stream, native.clone());
     let group = ShellGroup(pid_file(&fixture.0.root.join("shell.pid")));
     let sleeper = pid_file(&fixture.0.root.join("sleep.pid"));
+    process.send("discard this queued message\nunfinished draft");
+    process.expect("unfinished draft");
     process.interrupt();
     process.expect("cancelled; completed changes were not rolled back");
     process.expect("> ");
@@ -601,6 +713,7 @@ fn shell_interrupt_cleans_group_and_preserves_tool_result() {
     assert!(!pending.exists(), "pending mutation ran after interruption");
     process.send("continue\n");
     let (stream, body) = server.request();
+    assert_user_text(&body, "continue\n");
     let input = body["input"].as_array().unwrap();
     let replay: Vec<_> = input
         .iter()

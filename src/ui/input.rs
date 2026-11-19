@@ -28,12 +28,26 @@ impl Terminal {
         if !wait_for_input(fd)? {
             return Ok(None);
         }
+        self.try_read_byte()
+    }
+
+    pub(super) fn try_read_byte(&self) -> io::Result<Option<u8>> {
         let mut byte = 0;
-        // SAFETY: read borrows an owned descriptor and a one-byte buffer.
-        match unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) } {
+        // SAFETY: read borrows an owned nonblocking descriptor and a one-byte buffer.
+        match unsafe { libc::read(self.input.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) } {
             0 => Ok(Some(4)), // Treat terminal EOF like Ctrl-D.
             1 => Ok(Some(byte)),
-            _ => Err(io::Error::last_os_error()),
+            _ => {
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -78,7 +92,7 @@ pub(super) fn dimensions() -> (usize, usize) {
     }
 }
 
-fn wrapped_rows(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrapped_rows(text: &str, width: usize) -> Vec<String> {
     let mut rows = vec![String::new()];
     let mut used = 0;
     for grapheme in text.graphemes(true) {
@@ -97,6 +111,26 @@ fn wrapped_rows(text: &str, width: usize) -> Vec<String> {
         used += cells;
     }
     rows
+}
+
+pub(super) fn wrapped_cursor(text: &str, cursor: usize, width: usize) -> (usize, usize) {
+    let (mut row, mut column) = (0, 0);
+    for (index, grapheme) in text.grapheme_indices(true) {
+        if index >= cursor {
+            break;
+        }
+        let cells = if grapheme.width() > width {
+            1
+        } else {
+            grapheme.width()
+        };
+        if column + cells > width {
+            row += 1;
+            column = 0;
+        }
+        column += cells;
+    }
+    (row, column)
 }
 
 fn redraw(
@@ -119,16 +153,7 @@ fn redraw_cursor(
 ) -> io::Result<()> {
     // Reserve the last column to avoid the emulator's pending soft-wrap state.
     let rows = wrapped_rows(text, size.0 - 1);
-    let mut remaining = cursor;
-    let mut cursor_row = 0;
-    for row in &rows {
-        if remaining <= row.len() {
-            break;
-        }
-        remaining -= row.len();
-        cursor_row += 1;
-    }
-    let column = rows[cursor_row][..remaining].width();
+    let (cursor_row, column) = wrapped_cursor(text, cursor, size.0 - 1);
     let start = cursor_row.saturating_sub(size.1 - 2);
     let visible = &rows[start..rows.len().min(start + size.1 - 1)];
     write!(out, "\r")?;
@@ -191,9 +216,9 @@ fn wait_for_input(fd: RawFd) -> io::Result<bool> {
 }
 
 #[derive(Default)]
-struct Editor {
-    line: String,
-    cursor: usize,
+pub(super) struct Editor {
+    pub(super) line: String,
+    pub(super) cursor: usize,
     history_index: usize,
     draft: String,
 }
@@ -266,31 +291,112 @@ impl Editor {
     }
 }
 
+/// Editor state survives the transition between busy and idle prompts, including
+/// a cursor in the middle of a grapheme-aware draft or an incomplete UTF-8 key.
+#[derive(Default)]
+pub(super) struct Draft {
+    pub(super) editor: Editor,
+    pending: Vec<u8>,
+    escape: Vec<u8>,
+}
+
+impl Draft {
+    pub(super) fn history_end(&mut self, history: &[String]) {
+        self.editor.history_index = history.len();
+    }
+
+    pub(super) fn key(&mut self, byte: u8, history: &[String]) -> Option<String> {
+        let editor = &mut self.editor;
+        if !self.escape.is_empty() {
+            self.escape.push(byte);
+            if self.escape.len() == 2 && matches!(byte, b'[' | b'O') {
+                return None;
+            }
+            if (0x40..=0x7e).contains(&byte) || self.escape.len() > 32 {
+                editor.key(&self.escape[1..], history);
+                self.escape.clear();
+            }
+            return None;
+        }
+        match byte {
+            b'\r' | b'\n' => {
+                let line = std::mem::take(&mut editor.line);
+                *self = Self::default();
+                self.editor.history_index = history.len();
+                return Some(format!("{line}\n"));
+            }
+            4 if editor.line.is_empty() => return Some(String::new()),
+            1 => editor.cursor = 0,
+            5 => editor.cursor = editor.line.len(),
+            8 | 127 => {
+                self.pending.clear();
+                let end = editor.cursor;
+                editor.left();
+                editor.line.replace_range(editor.cursor..end, "");
+            }
+            21 => {
+                editor.line.replace_range(..editor.cursor, "");
+                editor.cursor = 0;
+            }
+            23 => {
+                let trimmed = editor.line[..editor.cursor].trim_end();
+                let start = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                editor.line.replace_range(start..editor.cursor, "");
+                editor.cursor = start;
+            }
+            27 => {
+                self.pending.clear();
+                self.escape.push(27);
+            }
+            0..=31 => {}
+            _ => {
+                self.pending.push(byte);
+                match std::str::from_utf8(&self.pending) {
+                    Ok(s) => {
+                        editor.insert(s);
+                        self.pending.clear();
+                    }
+                    Err(e) if e.error_len().is_none() => {}
+                    Err(_) => self.pending.clear(),
+                }
+            }
+        }
+        None
+    }
+}
+
 pub fn read_line(prompt: &str) -> Result<String> {
     read_line_with_history(prompt, &mut Vec::new())
 }
 
 pub(super) fn read_line_with_history(prompt: &str, history: &mut Vec<String>) -> Result<String> {
-    let result = edit_line(prompt, history)?;
+    read_line_with_draft(prompt, history, &mut Draft::default())
+}
+
+pub(super) fn remember(history: &mut Vec<String>, result: &str) {
     let entry = result.trim_end_matches('\n');
     if !entry.is_empty() && history.last().is_none_or(|last| last != entry) {
         history.push(entry.to_owned());
     }
+}
+
+pub(super) fn read_line_with_draft(
+    prompt: &str,
+    history: &mut Vec<String>,
+    draft: &mut Draft,
+) -> Result<String> {
+    let result = edit_line(prompt, history, draft)?;
+    remember(history, &result);
     Ok(result)
 }
 
-fn edit_line(prompt: &str, history: &[String]) -> Result<String> {
+fn edit_line(prompt: &str, history: &[String], draft: &mut Draft) -> Result<String> {
     check_interrupt()?;
     let restore = Terminal::enter()?;
     let input_fd = restore.input.as_raw_fd();
     let styled = ui::styles_enabled(io::stderr().is_terminal());
     let mut out = io::stderr().lock();
-    let mut editor = Editor {
-        history_index: history.len(),
-        ..Editor::default()
-    };
-    let mut pending = Vec::new();
-    let mut escape = Vec::new();
+    draft.editor.history_index = history.len();
     let mut last_size = (0, 0);
     let mut painted_rows = 0;
     let mut dirty = true;
@@ -301,11 +407,11 @@ fn edit_line(prompt: &str, history: &[String]) -> Result<String> {
         // Coalesce bursts (paste/key repeat) instead of flooding the terminal.
         if size != last_size || (dirty && painted.elapsed() >= std::time::Duration::from_millis(16))
         {
-            let text = format!("{prompt}{}", editor.line);
+            let text = format!("{prompt}{}", draft.editor.line);
             redraw_cursor(
                 &mut out,
                 &text,
-                prompt.len() + editor.cursor,
+                prompt.len() + draft.editor.cursor,
                 size,
                 &mut painted_rows,
                 styled,
@@ -337,66 +443,14 @@ fn edit_line(prompt: &str, history: &[String]) -> Result<String> {
             return Ok(String::new());
         }
         check_interrupt()?;
-        if !escape.is_empty() {
-            escape.push(byte);
-            if escape.len() == 2 && matches!(byte, b'[' | b'O') {
-                continue;
-            }
-            if (0x40..=0x7e).contains(&byte) || escape.len() > 32 {
-                editor.key(&escape[1..], history);
-                escape.clear();
-                dirty = true;
-            }
-            continue;
-        }
-        match byte {
-            b'\r' | b'\n' => {
-                let text = format!("{prompt}{}", editor.line);
+        let text = format!("{prompt}{}", draft.editor.line);
+        if let Some(line) = draft.key(byte, history) {
+            if !line.is_empty() {
                 redraw(&mut out, &text, size, &mut painted_rows, styled)?;
                 writeln!(out)?;
                 out.flush()?;
-                return Ok(format!("{}\n", editor.line));
             }
-            4 if editor.line.is_empty() => return Ok(String::new()),
-            1 => editor.cursor = 0,                 // Ctrl-A
-            5 => editor.cursor = editor.line.len(), // Ctrl-E
-            8 | 127 => {
-                pending.clear();
-                let end = editor.cursor;
-                editor.left();
-                editor.line.replace_range(editor.cursor..end, "");
-            }
-            21 => {
-                editor.line.replace_range(..editor.cursor, "");
-                editor.cursor = 0;
-            }
-            23 => {
-                // Ctrl-W deletes the word before the cursor, preserving the suffix.
-                let trimmed = editor.line[..editor.cursor].trim_end();
-                let start = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
-                editor.line.replace_range(start..editor.cursor, "");
-                editor.cursor = start;
-            }
-            27 => {
-                pending.clear();
-                escape.push(27);
-                continue;
-            }
-            0..=31 => continue,
-            _ => {
-                pending.push(byte);
-                match std::str::from_utf8(&pending) {
-                    Ok(s) => {
-                        editor.insert(s);
-                        pending.clear();
-                    }
-                    Err(e) if e.error_len().is_none() => continue,
-                    Err(_) => {
-                        pending.clear();
-                        continue;
-                    }
-                }
-            }
+            return Ok(line);
         }
         dirty = true;
     }
@@ -487,6 +541,45 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn draft_preserves_unicode_cursor_history_and_partial_keys() {
+        let mut draft = Draft::default();
+        let history = vec!["previous".into()];
+        draft.history_end(&history);
+        for byte in "界e\u{301} ac\x1b[Db".bytes() {
+            assert!(draft.key(byte, &history).is_none());
+        }
+        assert_eq!(draft.editor.line, "界e\u{301} abc");
+        // The draft and cursor remain intact when the editor is handed off.
+        for byte in b"\x1b[D\x7f" {
+            draft.key(*byte, &history);
+        }
+        assert_eq!(draft.editor.line, "界e\u{301} bc");
+        for byte in b"\x1b[A" {
+            draft.key(*byte, &history);
+        }
+        assert_eq!(draft.editor.line, "previous");
+        for byte in b"\x1b[B" {
+            draft.key(*byte, &history);
+        }
+        assert_eq!(draft.editor.line, "界e\u{301} bc");
+        draft.key(5, &history);
+        let bytes = "🙂".as_bytes();
+        draft.key(bytes[0], &history);
+        for byte in &bytes[1..] {
+            draft.key(*byte, &history);
+        }
+        assert_eq!(draft.key(b'\r', &history).unwrap(), "界e\u{301} bc🙂\n");
+        assert!(draft.editor.line.is_empty());
+    }
+
+    #[test]
+    fn narrow_cursor_uses_display_cells_not_replacement_byte_lengths() {
+        let text = "> 🙂e\u{301}";
+        assert_eq!(wrapped_rows(text, 1), [">", " ", "�", "e\u{301}"]);
+        assert_eq!(wrapped_cursor(text, text.len(), 1), (3, 1));
     }
 
     #[test]
