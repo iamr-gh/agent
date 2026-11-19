@@ -1,4 +1,5 @@
 mod auth;
+mod discord;
 mod engine;
 mod session;
 mod skills;
@@ -19,7 +20,12 @@ fn install_interrupt_handler() {
 }
 fn main() {
     install_interrupt_handler();
-    if let Err(error) = ui::run() {
+    let result = if std::env::args().nth(1).as_deref() == Some("--discord-worker") {
+        discord::run()
+    } else {
+        ui::run()
+    };
+    if let Err(error) = result {
         eprintln!("ag: {}", ui::display(&error.to_string()));
         std::process::exit(
             if INTERRUPTED.load(Ordering::Relaxed) || error.is::<llm_api::Cancelled>() {
