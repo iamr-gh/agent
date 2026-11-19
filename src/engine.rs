@@ -338,12 +338,16 @@ pub(crate) fn turn_saved(
     mut checkpoint: impl FnMut(&Request) -> Result<()>,
 ) -> Result<()> {
     let mut tool_number = 0;
+    let page_tool_output = crate::tool_history::enabled();
     for _ in 0..max_turns {
         check_interrupt()?;
         if serde_json::to_vec(request)?.len() > max_context_bytes {
             return Err(format!("context exceeds {max_context_bytes} bytes; increase --max-context-kib or start a new conversation (no silent truncation)").into());
         }
-        let response = infer(request)?;
+        let projected = page_tool_output
+            .then(|| crate::tool_history::project(request))
+            .flatten();
+        let response = infer(projected.as_ref().unwrap_or(request))?;
         check_interrupt()?;
         let calls: Vec<_> = response
             .message
@@ -401,8 +405,14 @@ pub(crate) fn turn_saved(
                 .frontend
                 .tool_started(tool_number, name, &call["arguments"]);
             let started = Instant::now();
-            let result =
-                field(call, "name").and_then(|name| workspace.execute(name, &call["arguments"]));
+            let result = field(call, "name").and_then(|name| {
+                if page_tool_output && name == crate::tool_history::TOOL {
+                    check_interrupt()?;
+                    crate::tool_history::page(request, &call["arguments"])
+                } else {
+                    workspace.execute(name, &call["arguments"])
+                }
+            });
             let is_error = result.is_err();
             let output = result.unwrap_or_else(|e| e.to_string());
             request.messages[results].content[index] = json!({"type":"tool_result", "id":call["id"], "output":output, "is_error":is_error});

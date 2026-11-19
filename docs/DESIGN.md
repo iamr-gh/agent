@@ -39,7 +39,11 @@ The available tools are `load_skill`, `read_file`, `write_file`, `edit_file`, an
 
 **Tools are automatically allowed by default.** `--ask` requires confirmation for shell commands and file writes; `--yes` enables automatic approval. An approval prompt shows the complete proposed arguments even when ordinary tool output is compact. Nonterminal approval fails closed. These policies are not a sandbox: shell commands run with the user's full privileges and can access files outside the workspace.
 
-The default per-prompt limits are 500 model calls and 4096 KiB of serialized context. The context limit is a byte budget, not a token estimate; provider limits still apply. Automatic compaction is not implemented.
+The default per-prompt limits are 500 model calls and 4096 KiB of serialized context. The context limit is a byte budget, not a token estimate; provider limits still apply. Automatic conversation summarization is not implemented.
+
+Set `AGENT_PAGE_TOOL_OUTPUT=1` to try historical tool-output paging. It is off by default. The inference request keeps at least the latest 16 messages intact and revisits older results at 16-message boundaries rather than rewriting the prefix every call. Old successful `read_file` and successful-exit `shell` outputs of at least 6 KiB keep roughly 2 KiB at each end. The model can recover omitted bytes in 8 KiB pages with `read_tool_output`, without rerunning any tools. User messages, skill instructions, tool errors, native replay, the saved transcript, and the local serialized context limit are unchanged. Paging edits old prefixes, which can affect provider prompt-cache hits; wire-byte savings alone do not establish token or quota savings.
+
+To measure serialized provider-request bytes without model calls or tool execution, run `AGENT_TRACE_FILES=/path/to/first.json:/path/to/second.json cargo test --locked --offline replay_saved_traces -- --ignored --nocapture`. This reconstructs one request per saved assistant response and prints aggregate bytes, not transcript content.
 
 ## Instructions, skills, and credentials
 

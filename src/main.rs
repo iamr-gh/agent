@@ -4,6 +4,7 @@ mod engine;
 mod models;
 mod session;
 mod skills;
+mod tool_history;
 mod ui;
 
 use engine::{INTERRUPTED, Workspace, check_interrupt};
