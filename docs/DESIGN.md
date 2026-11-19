@@ -4,7 +4,7 @@ This document describes the current application. See [saved sessions](SESSIONS.m
 
 ## Responsibilities
 
-`agent` is a Unix terminal application with a sequential conversation/tool loop. The `llm-api` dependency handles provider requests, streaming events, native message replay, and network cancellation. The application owns prompts, credentials, tools, approvals, workspace effects, sessions, and terminal presentation.
+`ag` is a Unix terminal application with a sequential conversation/tool loop. The `llm-api` dependency handles provider requests, streaming events, native message replay, and network cancellation. The application owns prompts, credentials, tools, approvals, workspace effects, sessions, and terminal presentation.
 
 | Module | Responsibility |
 | --- | --- |

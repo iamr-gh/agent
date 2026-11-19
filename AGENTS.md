@@ -21,13 +21,13 @@ After a successful release build, refresh the local executable symlink:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-ln -sfn "$PWD/target/release/agent" "$HOME/.local/bin/agent"
-"$HOME/.local/bin/agent" --help
-command -v agent
-ls -l "$HOME/.local/bin/agent"
+ln -sfn "$PWD/target/release/ag" "$HOME/.local/bin/ag"
+"$HOME/.local/bin/ag" --help
+command -v ag
+ls -l "$HOME/.local/bin/ag"
 ```
 
-Inspect the destination before relinking. If it is an existing non-symlink file or directory, ask before replacing it. Verify that `agent` on PATH resolves to the intended installation. A running agent process must be restarted to use the rebuilt executable.
+Inspect the destination before relinking. If it is an existing non-symlink file or directory, ask before replacing it. Verify that `ag` on PATH resolves to the intended installation. A running agent process must be restarted to use the rebuilt executable.
 
 ## Commits and delivery
 

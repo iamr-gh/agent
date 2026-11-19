@@ -47,7 +47,7 @@ def main():
     parser.add_argument("--scenario", choices=["read", "deny", "approve", "code"], default="read")
     args = parser.parse_args()
     env = credentials(args.provider, args.model)
-    binary = ROOT / "target" / "release" / "agent"
+    binary = ROOT / "target" / "release" / "ag"
     marker = "AGENT_LIVE_" + secrets.token_hex(8)
     with tempfile.TemporaryDirectory(prefix="agent-live-") as directory:
         workspace = Path(directory)

@@ -25,7 +25,7 @@ The Rust tests cover:
 - Terminal cursor editing, Unicode graphemes, wrapped redraw, input history, response typeahead, session-picker filtering, and Markdown/plain-output rendering.
 - Process/PTY cancellation, stalled loopback requests, batch exit 130, shell process-group cleanup, and successful interactive continuation.
 
-`tests/sessions.py` uses a disposable private agent home and synthetic credentials, without model requests. It checks session clearing, picker filtering/navigation/cancellation, locked selections, direct resume, exact context preservation, and reload after executable replacement, including a failed reload retaining the writer lock. It accepts an optional binary path; the default is `target/release/agent`.
+`tests/sessions.py` uses a disposable private agent home and synthetic credentials, without model requests. It checks session clearing, picker filtering/navigation/cancellation, locked selections, direct resume, exact context preservation, and reload after executable replacement, including a failed reload retaining the writer lock. It accepts an optional binary path; the default is `target/release/ag`.
 
 These checks do not prove model instruction following, production-provider availability, sandbox isolation, exactly-once effects, or recovery of arbitrary external processes. Record the actual commands, outcomes, and environment for a verification run rather than copying an old test count.
 

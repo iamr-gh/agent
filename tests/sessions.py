@@ -1,4 +1,4 @@
-"""Offline PTY smoke test: python3 tests/sessions.py [path/to/agent]. No API calls."""
+"""Offline PTY smoke test: python3 tests/sessions.py [path/to/ag]. No API calls."""
 import fcntl
 import json
 import os
@@ -12,7 +12,7 @@ import tempfile
 import termios
 import time
 
-BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/agent").resolve()
+BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/ag").resolve()
 
 
 class Terminal:
@@ -74,7 +74,7 @@ class Terminal:
 
 with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
     root = Path(temporary)
-    binary = root / "agent"
+    binary = root / "ag"
     shutil.copy2(BINARY, binary)
     workspace = root / "workspace"
     workspace.mkdir()
