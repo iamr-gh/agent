@@ -43,7 +43,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.state.start()
         self.client = bot.AgentBot()
         self.thread = SimpleNamespace(id=1234, send=AsyncMock())
-        self.client.db.execute("INSERT INTO sessions VALUES (?, NULL)", (self.thread.id,))
+        self.client.db.execute("INSERT INTO sessions (thread, session) VALUES (?, NULL)", (self.thread.id,))
         self.client.db.commit()
 
     async def asyncTearDown(self):
@@ -53,18 +53,54 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     def interaction(self, owner=bot.OWNER_ID):
-        return SimpleNamespace(user=SimpleNamespace(id=owner), guild=object(),
+        return SimpleNamespace(user=SimpleNamespace(id=owner), guild=object(), channel_id=self.thread.id,
                                response=SimpleNamespace(send_message=AsyncMock(), edit_message=AsyncMock()))
 
     async def test_only_owner_can_start_stop_or_approve(self):
         interaction = self.interaction(42)
         await self.client.start_session(interaction, "hello")
         await self.client.stop_turn(interaction)
+        await self.client.settings(interaction, True, 10)
         view = bot.Approval()
         self.assertFalse(await view.interaction_check(interaction))
-        self.assertEqual(interaction.response.send_message.await_count, 3)
+        self.assertEqual(interaction.response.send_message.await_count, 4)
         self.assertFalse(view.allowed)
         view.stop()
+
+    async def test_existing_threads_default_to_manual_and_new_command_defaults_to_auto(self):
+        row = self.client.db.execute("SELECT auto_approve, max_turns FROM sessions WHERE thread=?", (self.thread.id,)).fetchone()
+        self.assertEqual(row, (0, 25))
+        parameters = {param.name: param for param in self.client.tree.get_command("agent").parameters}
+        self.assertIs(parameters["auto_approve"].default, True)
+        self.assertEqual(parameters["max_turns"].default, 25)
+        self.assertEqual(parameters["max_turns"].min_value, 1)
+        self.assertEqual(parameters["max_turns"].max_value, 100)
+
+    async def test_owner_can_change_persistent_thread_policy(self):
+        await self.client.settings(self.interaction(), True, 7)
+        row = self.client.db.execute("SELECT auto_approve, max_turns FROM sessions WHERE thread=?", (self.thread.id,)).fetchone()
+        self.assertEqual(row, (1, 7))
+        other = bot.AgentBot()
+        self.assertEqual(other.db.execute("SELECT auto_approve, max_turns FROM sessions WHERE thread=?", (self.thread.id,)).fetchone(), (1, 7))
+        other.db.close()
+        await other.close()
+        self.client.active_thread = self.thread.id
+        await self.client.settings(self.interaction(), False, 3)
+        self.assertEqual(self.client.db.execute("SELECT auto_approve, max_turns FROM sessions WHERE thread=?", (self.thread.id,)).fetchone(), (1, 7))
+
+    async def test_legacy_database_migration_preserves_session_and_manual_mode(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as root:
+            db = sqlite3.connect(Path(root) / "state.sqlite3")
+            db.execute("CREATE TABLE sessions (thread INTEGER PRIMARY KEY, session TEXT)")
+            db.execute("INSERT INTO sessions VALUES (1, 'saved-context')")
+            db.commit()
+            db.close()
+            with patch.object(bot, "STATE", Path(root)):
+                migrated = bot.AgentBot()
+            self.assertEqual(migrated.db.execute("SELECT session, auto_approve, max_turns FROM sessions WHERE thread=1").fetchone(), ("saved-context", 0, 25))
+            migrated.db.close()
+            await migrated.close()
 
     async def test_approval_is_single_use(self):
         view = bot.Approval()
@@ -117,6 +153,27 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         row = self.client.db.execute("SELECT session FROM sessions WHERE thread=1234").fetchone()
         self.assertEqual(row[0], "test-session")
         self.assertIn("Turn complete", self.thread.send.call_args.args[0])
+
+    async def test_auto_policy_reaches_worker_and_limit_is_not_reported_as_failure(self):
+        await self.client.settings(self.interaction(), True, 2)
+        stream = asyncio.StreamReader()
+        for event in [{"type": "limit", "max_turns": 2}, {"type": "done"}]:
+            stream.feed_data((json.dumps(event) + "\n").encode())
+        stream.feed_eof()
+        writes = []
+        process = SimpleNamespace(stdout=stream, returncode=0, wait=AsyncMock(return_value=0),
+                                  stdin=SimpleNamespace(write=writes.append, drain=AsyncMock()))
+        with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=process)):
+            await self.client.execute(self.thread, "task")
+        self.assertEqual(json.loads(writes[0]), {"prompt": "task", "session": None, "auto_approve": True, "max_turns": 2})
+        self.assertIn("2-model-call cap", self.thread.send.call_args.args[0])
+
+    async def test_corrupt_saved_policy_never_launches_worker(self):
+        self.client.db.execute("UPDATE sessions SET max_turns=0")
+        self.client.db.commit()
+        with patch.object(asyncio, "create_subprocess_exec", AsyncMock()) as spawn:
+            await self.client.execute(self.thread, "task")
+        spawn.assert_not_awaited()
 
     async def test_worker_approval_returns_only_explicit_decision(self):
         for allowed in (False, True):

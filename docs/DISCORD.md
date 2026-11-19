@@ -25,18 +25,20 @@ Keep the process running; it does not install an automatic startup service. Glob
 
 ## Use
 
-- In a server text channel, run `/agent prompt:Describe this project`.
-- The bot creates a public thread. Reply in that thread to continue; only text is submitted (attachments are not ingested).
-- File writes/edits and every shell command require a fresh Approve/Deny decision. Review the complete `approval.json` attachment before approving. Buttons are owner-only, single-use, and expire after two minutes; timeout denies the action.
+- In a server text channel, run `/agent prompt:Describe this project`. New threads default to **automatic tool approvals** and **25 model calls per prompt**. You can explicitly choose `auto_approve:false` and `max_turns:10` (allowed range: 1–100).
+- The bot creates a public thread. Reply in that thread to continue; only text is submitted (attachments are not ingested). Each reply gets a fresh model-call budget. At the cap, work stops without another inference request; completed changes and context remain, and the bot reports the limit rather than a generic error.
+- Auto mode permits every shell command and file change with full local account privileges, just like the CLI's `--yes`. **The cap counts model calls, not individual tool calls, runtime, money, or changes.** Each model response can contain multiple tool calls; a cap is not a security boundary.
+- Use `/agent_settings auto_approve:true max_turns:25` inside an existing agent thread to change its policy for subsequent prompts, or set `auto_approve:false` for buttons. Settings persist across restarts and can only be changed by the owner while the thread is idle. Threads created before this feature stay in manual mode until you explicitly change them.
+- In manual mode, file writes/edits and every shell command require a fresh Approve/Deny decision. Review the complete `approval.json` attachment before approving. Buttons are owner-only, single-use, and expire after two minutes; timeout denies the action.
 - `/agent_stop` cancels the single active turn. Already completed effects are not rolled back.
 - One turn can run at a time across all threads; busy prompts are rejected, not queued. Avoid simultaneously editing the same workspace through the terminal agent.
-- Long answers are sent as UTF-8 attachments. Raw tool output and model reasoning are not posted; mention generation is disabled. Answers and approval arguments can still expose repository secrets, so use only private, trusted channels.
+- Discord asks the model for concise final summaries (changes, checks, blockers) rather than tool-by-tool narration. Intermediate tool-step commentary, raw tool output, and reasoning are not posted. Full context/tool results remain in the local saved session. Long final answers are sent as UTF-8 attachments; mention generation is disabled. Answers and approval arguments can still expose repository secrets, so use only private, trusted channels.
 
 Thread-to-session mappings and received Discord event IDs persist in `~/.agent/discord/state.sqlite3`; model context uses the existing private saved sessions under `$AGENT_HOME/sessions`. Restart the bot and reply in the same thread to resume. A crashed or cancelled turn is never automatically retried, and saved tools are never replayed. Events received while offline are not backfilled. Deduplication prevents duplicate received prompts but is not an exactly-once guarantee across crashes.
 
 ## Boundaries and limitations
 
-`ag --discord-worker` is an internal JSON-lines subprocess entry point: the adapter supplies a prompt/session on stdin, receives session/answer/approval/done events on stdout, and returns an explicit boolean for each approval. It always disables automatic tool approval. Each turn has an isolated process and reuses the existing engine, credential discovery, and session checkpoints, with limits of 100 model calls and 4 MiB serialized context. The worker doesn't stream partial reasoning or answers to Discord.
+`ag --discord-worker` is an internal JSON-lines subprocess entry point: the adapter supplies a prompt/session and the owner-selected `auto_approve`/`max_turns` policy on stdin, receives session/answer/approval/limit/done events on stdout, and returns an explicit boolean for each manual approval. Missing policy fields default to manual mode and 25 calls; malformed fields or limits outside 1–100 fail before tools run. Permissions are never inferred from model output or loaded from saved model context. Each turn has an isolated process and reuses the same engine, tools, credential discovery, and session checkpoints, with a 4 MiB serialized context limit. Only the final complete answer is sent to Discord, not intermediate tool-step commentary or reasoning. The terminal CLI is unchanged.
 
 A disconnect cancels active work and invalidates pending approval. Process cleanup first sends SIGINT and denies any waiting approval; after five seconds it kills an unresponsive worker. Interrupted snapshots retain recovery warnings, not automatic retries. Detached shell jobs may survive cancellation, as with the CLI. Provider failures are summarized without uploading raw errors; inspect local credentials and saved context to diagnose them.
 
@@ -66,3 +68,14 @@ Python tests use synthetic credentials and mocked Discord/worker objects. They c
 - `~/.local/share/agent-discord-venv/bin/python -m unittest discover -s integrations/discord -p 'test_*.py' -v`: passed (12 tests).
 - Live startup authenticated and registered commands, but the Gateway rejected Message Content Intent (`PrivilegedIntentsRequired`). Enable that intent for the application corresponding to the installed token, save, then restart. No model requests or live tool effects were tested. No bot process is left running.
 - A subsequent production Clippy recheck was blocked by concurrent, unrelated edits to `src/ui/input.rs` (undefined `editor`, `escape`, and `pending` variables). The successful release build above predates those edits; no changes to that file are included in the Discord integration.
+
+### Bounded auto-approval verification
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked --offline discord::`: 3 passed (strict manual grants, validated policy, and automatic shell execution stopping at the exact model-call cap).
+- `cargo test --locked --offline`: 74 passed, 1 live metadata test ignored. The earlier PTY failures above no longer occur with the current working tree.
+- `cargo clippy --locked --offline --all-targets -- -D warnings`: still blocked by the same two unrelated test-code warnings listed above.
+- `cargo clippy --locked --offline --bin ag -- -D warnings`: passed.
+- `cargo build --release --locked --offline`: passed; local executable symlink refreshed and help checked.
+- `~/.local/share/agent-discord-venv/bin/python -m unittest discover -s integrations/discord -p 'test_*.py' -v`: 17 passed, including persistent policy settings, owner checks, old-database migration, bounded protocol, and corrupt-policy rejection.
+- Live worker smoke test: automatic mode executed only `printf DISCORD_AUTO_OK`, stopped at a one-model-call cap, emitted no approval prompt, and retained a successful tool result in an inactive saved session. The Discord connection and a live model response were also verified after the intent was enabled. Approval buttons and the new slash settings still need an owner-driven Discord interaction test.

@@ -30,6 +30,23 @@ fn is_approval(answer: &Value) -> bool {
     answer == &json!({"approve":true})
 }
 
+const COMPACT_INSTRUCTIONS: &str = "\nDiscord presentation: give a concise final answer summarizing changes, checks, and blockers. Avoid tool-by-tool narration. Prefer under 200 words unless the user requests detail. Never omit important failures or risks.";
+
+fn policy(input: &Value) -> Result<(bool, usize)> {
+    let auto_approve = match input.get("auto_approve") {
+        None => false,
+        Some(value) => value.as_bool().ok_or("auto_approve must be a boolean")?,
+    };
+    let max_turns = match input.get("max_turns") {
+        None => 25,
+        Some(value) => value
+            .as_u64()
+            .filter(|n| (1..=100).contains(n))
+            .ok_or("max_turns must be an integer from 1 to 100")? as usize,
+    };
+    Ok((auto_approve, max_turns))
+}
+
 struct DiscordFrontend;
 impl Frontend for DiscordFrontend {
     fn approve(&self, name: &str, args: &Value) -> Result<()> {
@@ -54,9 +71,10 @@ pub(crate) fn run() -> Result<()> {
         .as_str()
         .filter(|s| !s.trim().is_empty())
         .ok_or("missing prompt")?;
+    let (auto_approve, max_turns) = policy(&input)?;
     let workspace = Workspace {
         root: std::env::current_dir()?.canonicalize()?,
-        yes: false,
+        yes: auto_approve,
         frontend: Box::new(DiscordFrontend),
     };
     let root = session::directory()?;
@@ -112,25 +130,34 @@ pub(crate) fn run() -> Result<()> {
         Client::new(provider, std::env::var(key)?)
     };
     emit(json!({"type":"session", "id":session.store.as_ref().unwrap().id}))?;
+    if !session.request.system.contains(COMPACT_INSTRUCTIONS) {
+        session.request.system.push_str(COMPACT_INSTRUCTIONS);
+    }
     session.request.messages.push(text("user", prompt.into()));
     session.save(true)?;
     let store = session.store.as_ref().unwrap();
-    turn_saved(
+    let result = turn_saved(
         &mut session.request,
         &workspace,
-        100,
+        max_turns,
         4 * 1024 * 1024,
         |request| {
             let response = client.run_cancellable(request, &INTERRUPTED, |_| true)?;
             for block in &response.message.content {
-                if block["type"] == "text" {
+                if response.finish_reason == "stop" && block["type"] == "text" {
                     emit(json!({"type":"answer", "text":block["text"]}))?;
                 }
             }
             Ok(response)
         },
         |request| store.save(request, true),
-    )?;
+    );
+    if let Err(error) = result {
+        if error.to_string() != "turn limit reached; stopped without another model request" {
+            return Err(error);
+        }
+        emit(json!({"type":"limit", "max_turns":max_turns}))?;
+    }
     session.save(false)?;
     emit(json!({"type":"done"}))
 }
@@ -138,8 +165,77 @@ pub(crate) fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn remote_workspace_never_auto_approves() {
+    fn worker_policy_defaults_fail_closed_and_bounds_turns() {
+        assert_eq!(policy(&json!({})).unwrap(), (false, 25));
+        assert_eq!(
+            policy(&json!({"auto_approve":true, "max_turns":1})).unwrap(),
+            (true, 1)
+        );
+        assert_eq!(
+            policy(&json!({"auto_approve":false, "max_turns":100})).unwrap(),
+            (false, 100)
+        );
+        for input in [
+            json!({"auto_approve":"true"}),
+            json!({"auto_approve":1}),
+            json!({"max_turns":0}),
+            json!({"max_turns":101}),
+            json!({"max_turns":-1}),
+            json!({"max_turns":1.5}),
+            json!({"max_turns":"25"}),
+        ] {
+            assert!(policy(&input).is_err());
+        }
+    }
+    #[test]
+    fn automatic_shell_tools_stop_at_the_model_call_cap() {
+        let (yes, max_turns) = policy(&json!({"auto_approve":true, "max_turns":2})).unwrap();
+        let workspace = Workspace {
+            root: std::env::current_dir().unwrap(),
+            yes,
+            frontend: Box::new(DiscordFrontend),
+        };
+        let mut request = crate::tests::request();
+        let mut calls = 0;
+        let error = turn_saved(
+            &mut request,
+            &workspace,
+            max_turns,
+            1024 * 1024,
+            |_| {
+                calls += 1;
+                Ok(crate::tests::response(
+                    vec![crate::tests::call(
+                        &calls.to_string(),
+                        "shell",
+                        json!({"command":"printf ok"}),
+                    )],
+                    "tool_calls",
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            error.to_string(),
+            "turn limit reached; stopped without another model request"
+        );
+        assert!(
+            request
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .iter()
+                .all(|block| block["type"] == "tool_result" && block["is_error"] == false)
+        );
+    }
+
+    #[test]
+    fn manual_approval_requires_an_exact_boolean_grant() {
         assert!(is_approval(&json!({"approve":true})));
         for answer in [
             json!({"approve":"true"}),

@@ -77,10 +77,17 @@ class AgentBot(discord.Client):
         STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(STATE / "state.sqlite3")
         self.db.execute("CREATE TABLE IF NOT EXISTS sessions (thread INTEGER PRIMARY KEY, session TEXT)")
+        # Old threads remain in manual mode; only new owner-created threads default to auto.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}
+        if "auto_approve" not in columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0")
+        if "max_turns" not in columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN max_turns INTEGER NOT NULL DEFAULT 25")
         self.db.execute("CREATE TABLE IF NOT EXISTS seen (id INTEGER PRIMARY KEY)")
         self.db.commit()
         self.tree.command(name="agent", description="Start an agent thread in the local agent repository")(self.start_session)
         self.tree.command(name="agent_stop", description="Cancel the active agent turn")(self.stop_turn)
+        self.tree.command(name="agent_settings", description="Set approval mode and per-prompt model-call cap for this thread")(self.settings)
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -93,7 +100,10 @@ class AgentBot(discord.Client):
         self.db.commit()
         return not inserted
 
-    async def start_session(self, interaction: discord.Interaction, prompt: str):
+    @app_commands.describe(auto_approve="Allow shell and file changes without buttons (full local privileges)",
+                           max_turns="Maximum model calls per prompt, not a tool-call or cost cap (1–100)")
+    async def start_session(self, interaction: discord.Interaction, prompt: str,
+                            auto_approve: bool = True, max_turns: app_commands.Range[int, 1, 100] = 25):
         if interaction.user.id != OWNER_ID or interaction.guild is None:
             await interaction.response.send_message("Not authorized; use your server.", ephemeral=True)
             return
@@ -109,13 +119,34 @@ class AgentBot(discord.Client):
             await interaction.response.send_message("Starting a local agent session…")
             message = await interaction.original_response()
             thread = await message.create_thread(name="Agent session", auto_archive_duration=1440)
-            self.db.execute("INSERT INTO sessions VALUES (?, NULL)", (thread.id,))
+            self.db.execute("INSERT INTO sessions (thread, session, auto_approve, max_turns) VALUES (?, NULL, ?, ?)",
+                            (thread.id, int(auto_approve), max_turns))
             self.db.commit()
             self.active_thread = thread.id
             await self.execute(thread, prompt)
         finally:
             self.active = None
             self.active_thread = None
+
+    @app_commands.describe(auto_approve="Allow shell and file changes without buttons (full local privileges)",
+                           max_turns="Maximum model calls per prompt (1–100); resets on each reply")
+    async def settings(self, interaction: discord.Interaction, auto_approve: bool,
+                       max_turns: app_commands.Range[int, 1, 100]):
+        if interaction.user.id != OWNER_ID or interaction.guild is None:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        thread_id = interaction.channel_id
+        if not self.db.execute("SELECT 1 FROM sessions WHERE thread=?", (thread_id,)).fetchone():
+            await interaction.response.send_message("Use this command inside an agent thread.", ephemeral=True)
+            return
+        if self.active_thread == thread_id:
+            await interaction.response.send_message("Wait for this turn to finish or cancel it before changing settings.", ephemeral=True)
+            return
+        self.db.execute("UPDATE sessions SET auto_approve=?, max_turns=? WHERE thread=?",
+                        (int(auto_approve), max_turns, thread_id))
+        self.db.commit()
+        mode = "Automatic approvals (full local privileges)" if auto_approve else "Approval buttons"
+        await interaction.response.send_message(f"{mode} · {max_turns} model calls per prompt. The cap resets on each reply; not a sandbox.")
 
     async def on_message(self, message):
         if message.author.bot or message.author.id != OWNER_ID or message.guild is None:
@@ -156,17 +187,23 @@ class AgentBot(discord.Client):
         process = None
         view = None
         try:
-            saved = self.db.execute("SELECT session FROM sessions WHERE thread=?", (thread.id,)).fetchone()[0]
+            saved, auto_approve, max_turns = self.db.execute(
+                "SELECT session, auto_approve, max_turns FROM sessions WHERE thread=?", (thread.id,)).fetchone()
+            if auto_approve not in (0, 1) or not isinstance(max_turns, int) or not 1 <= max_turns <= 100:
+                raise ValueError("Invalid saved permission policy")
             process = await asyncio.create_subprocess_exec(
                 str(BINARY), "--discord-worker", cwd=WORKSPACE, env=worker_env(),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 # Provider errors may include sensitive details: never upload them.
                 stderr=asyncio.subprocess.DEVNULL, limit=2 * 1024 * 1024,
             )
-            process.stdin.write((json.dumps({"prompt": prompt, "session": saved}) + "\n").encode())
+            process.stdin.write((json.dumps({"prompt": prompt, "session": saved,
+                                             "auto_approve": bool(auto_approve), "max_turns": max_turns}) + "\n").encode())
             await process.stdin.drain()
-            await thread.send("Working. Shell and file changes require approval; this is not a sandbox.")
+            mode = "auto approvals — full local privileges" if auto_approve else "approval buttons"
+            await thread.send(f"Working · {mode} · max {max_turns} model calls. Not a sandbox.")
             done = False
+            limited = False
             while line := await process.stdout.readline():
                 event = json.loads(line)
                 kind = event.get("type")
@@ -194,9 +231,14 @@ class AgentBot(discord.Client):
                     process.stdin.write((json.dumps({"approve": view.allowed}) + "\n").encode())
                     await process.stdin.drain()
                     view = None
+                elif kind == "limit":
+                    limited = True
                 elif kind == "done":
                     done = True
             code = await process.wait()
+            if limited and done and code == 0:
+                await thread.send(f"Stopped at the {max_turns}-model-call cap. Completed changes remain; reply to continue with a fresh budget.")
+                return
             await thread.send("Turn complete. Reply here to continue." if done and code == 0 else
                               "Turn stopped with an error. Saved context is retained; inspect local state before retrying. Check local provider credentials if no response appeared.")
         except asyncio.CancelledError:
