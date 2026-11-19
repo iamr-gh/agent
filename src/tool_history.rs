@@ -55,8 +55,9 @@ pub(crate) fn project(request: &Request) -> Option<Request> {
             }
             let head = floor_boundary(output, EDGE);
             let tail = floor_boundary(output, output.len() - EDGE);
+            let reference = format!("call:{}", block["id"].as_str().unwrap_or_default());
             let shortened = format!(
-                "{}\n[Older tool output: omitted bytes {}–{}. To recover the original, call {TOOL} with reference \"{i}:{j}\" and offset {head}.]\n{}",
+                "{}\n[Older tool output: omitted bytes {}–{}. To recover the original, call {TOOL} with reference {reference:?} and offset {head}.]\n{}",
                 &output[..head],
                 head,
                 tail,
@@ -83,19 +84,30 @@ pub(crate) fn page(request: &Request, args: &Value) -> Result<String> {
     {
         return Err("unknown argument".into());
     }
-    let (i, j) = args["reference"]
+    // Use call IDs rather than message indices: compaction moves retained results.
+    let id = args["reference"]
         .as_str()
-        .and_then(|s| s.split_once(':'))
-        .and_then(|(i, j)| Some((i.parse::<usize>().ok()?, j.parse::<usize>().ok()?)))
+        .and_then(|s| s.strip_prefix("call:"))
+        .filter(|s| !s.is_empty())
         .ok_or("expected a saved tool result reference")?;
-    let output = request
+    let mut results = request
         .messages
-        .get(i)
-        .and_then(|m| m.content.get(j))
-        .filter(|b| b["type"] == "tool_result" && b["is_error"] == false)
-        .filter(|b| matches!(eligible(request, i, b), Some("read_file" | "shell")))
-        .and_then(|b| b["output"].as_str())
-        .ok_or("unknown tool result reference")?;
+        .iter()
+        .enumerate()
+        .flat_map(|(i, message)| {
+            message.content.iter().filter_map(move |b| {
+                (b["type"] == "tool_result"
+                    && b["id"] == id
+                    && b["is_error"] == false
+                    && matches!(eligible(request, i, b), Some("read_file" | "shell")))
+                .then(|| b["output"].as_str())
+                .flatten()
+            })
+        });
+    let output = results.next().ok_or("unknown tool result reference")?;
+    if results.next().is_some() {
+        return Err("ambiguous tool result reference".into());
+    }
     let offset = match args.get("offset") {
         None => 0,
         Some(v) => v
@@ -157,6 +169,8 @@ mod tests {
                 .push(crate::engine::text("user", "task".into()));
         }
         req.messages.extend(old.messages[1..3].iter().cloned());
+        req.messages[32].content[0]["id"] = json!("recent");
+        req.messages[33].content[0]["id"] = json!("recent");
         let orig = req.clone();
         let view = project(&req).unwrap();
         assert_same(&req, &orig);
@@ -167,19 +181,23 @@ mod tests {
             view.messages[2].content[0]["output"]
                 .as_str()
                 .unwrap()
-                .contains("2:0")
+                .contains("call:0")
         );
         for i in [4, 6, 8, 33] {
             assert_eq!(view.messages[i].content, orig.messages[i].content);
         }
         let mut rebuilt = String::new();
         while rebuilt.len() < output.len() {
-            let page = page(&req, &json!({"reference":"2:0","offset":rebuilt.len()})).unwrap();
+            let page = page(&req, &json!({"reference":"call:0","offset":rebuilt.len()})).unwrap();
             rebuilt.push_str(page.split_once('\n').unwrap().1);
         }
         assert_eq!(rebuilt, output);
-        assert!(page(&req, &json!({"reference":"2:0","offset":1})).is_err());
-        assert!(page(&req, &json!({"reference":"4:0"})).is_err());
+        assert!(page(&req, &json!({"reference":"call:0","offset":1})).is_err());
+        assert!(page(&req, &json!({"reference":"call:1"})).is_err());
+        let mut shifted = req;
+        shifted.messages.remove(0);
+        assert!(page(&shifted, &json!({"reference":"call:0"})).is_ok());
+        assert!(page(&shifted, &json!({"reference":"2:0"})).is_err());
     }
 
     // Offline trace replay: use the actual provider encoder; print sizes, never transcript content.

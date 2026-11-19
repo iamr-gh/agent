@@ -329,17 +329,45 @@ pub(crate) fn turn(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn turn_saved(
     request: &mut Request,
     workspace: &Workspace,
     max_turns: usize,
     max_context_bytes: usize,
+    infer: impl FnMut(&Request) -> Result<Response>,
+    checkpoint: impl FnMut(&Request) -> Result<()>,
+) -> Result<()> {
+    turn_compacting(
+        request,
+        workspace,
+        max_turns,
+        max_context_bytes,
+        |_| Ok(false),
+        infer,
+        checkpoint,
+    )
+}
+
+pub(crate) fn turn_compacting(
+    request: &mut Request,
+    workspace: &Workspace,
+    max_turns: usize,
+    max_context_bytes: usize,
+    mut compact: impl FnMut(&mut Request) -> Result<bool>,
     mut infer: impl FnMut(&Request) -> Result<Response>,
     mut checkpoint: impl FnMut(&Request) -> Result<()>,
 ) -> Result<()> {
     let mut tool_number = 0;
     let page_tool_output = crate::tool_history::enabled();
-    for _ in 0..max_turns {
+    let mut remaining = max_turns;
+    while remaining > 0 {
+        check_interrupt()?;
+        // Leave room for the actual task request. Compaction itself is one model call.
+        if remaining > 1 && compact(request)? {
+            remaining -= 1;
+        }
+        remaining -= 1;
         check_interrupt()?;
         if serde_json::to_vec(request)?.len() > max_context_bytes {
             return Err(format!("context exceeds {max_context_bytes} bytes; increase --max-context-kib or start a new conversation (no silent truncation)").into());

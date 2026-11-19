@@ -102,6 +102,10 @@ impl Store {
         Ok(store)
     }
 
+    pub fn archive(&self, request: &Request) -> Result<String> {
+        Ok(Self::create(&self.root, &self.workspace, self.provider, request)?.id)
+    }
+
     pub fn save(&self, request: &Request, active: bool) -> Result<()> {
         let data = json!({"version":1, "workspace":self.workspace, "provider":self.provider,
             "request":request, "active":active});

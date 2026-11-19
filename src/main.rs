@@ -1,4 +1,5 @@
 mod auth;
+mod compaction;
 mod discord;
 mod engine;
 mod models;

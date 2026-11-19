@@ -1,12 +1,12 @@
 //! CLI configuration and terminal conversation controller.
 use super::{StreamDisplay, TerminalFrontend, input, live, styles_enabled};
 use crate::{
-    INTERRUPTED, Workspace, auth, check_interrupt,
-    engine::{text, tools, turn_saved},
+    INTERRUPTED, Workspace, auth, check_interrupt, compaction,
+    engine::{text, tools, turn_compacting},
     session::{self, Session, Store},
     skills,
 };
-use llm_api::{Client, Provider, Request, Result};
+use llm_api::{Cancelled, Client, Provider, Request, Result};
 use serde_json::json;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::Ordering;
@@ -46,6 +46,9 @@ pub(crate) fn run() -> Result<()> {
                     .parse()?
             }
             "--help" | "-h" => {
+                println!(
+                    "/compact summarizes older conversation. Automatic compaction defaults to 128 KiB of message content; set AGENT_COMPACT_KIB=0 to disable it."
+                );
                 println!(
                     "Interactive terminal: type in the live input area while the agent works; Enter queues a follow-up for after the current turn. Ctrl-C cancels and discards pending input."
                 );
@@ -185,6 +188,7 @@ fn chat_session(
     max_context_bytes: usize,
     verbose: bool,
 ) -> Result<()> {
+    let compact_threshold = compaction::threshold()?;
     // Capture the path before a rebuild replaces the running executable's inode.
     let executable = std::env::current_exe()?;
     let interactive = prompt.is_empty();
@@ -222,6 +226,25 @@ fn chat_session(
                 break;
             }
             match input.trim() {
+                "/compact" => {
+                    let busy = typing.busy()?;
+                    let result = compaction::manual(
+                        &mut session.request,
+                        &client,
+                        session.store.as_ref(),
+                        compaction_notice,
+                    );
+                    if let Some(busy) = busy {
+                        busy.finish(&mut typing)?;
+                    }
+                    if result.as_ref().is_err_and(|error| error.is::<Cancelled>()) {
+                        INTERRUPTED.store(false, Ordering::Relaxed);
+                        eprintln!("compaction cancelled");
+                    } else {
+                        result?;
+                    }
+                    continue;
+                }
                 "/quit" => break,
                 "/clear" => {
                     session.request.messages.clear();
@@ -350,11 +373,17 @@ fn chat_session(
         let store = &session.store;
         let mut checkpoint_failed = false;
         let busy = if interactive { typing.busy()? } else { None };
-        let result = turn_saved(
+        let result = turn_compacting(
             &mut session.request,
             &workspace,
             max_turns,
             max_context_bytes,
+            compaction::automatic(
+                &client,
+                store.as_ref(),
+                compact_threshold,
+                compaction_notice,
+            ),
             |req| {
                 let styled = styles_enabled(io::stdout().is_terminal());
                 let mut stream = StreamDisplay::new(styled);
@@ -400,6 +429,10 @@ fn chat_session(
         }
     }
     Ok(())
+}
+
+fn compaction_notice(message: &str) {
+    let _ = live::output(&format!("{}\n", super::display(message)), true);
 }
 
 fn preview(session: &Session, verbose: bool) {

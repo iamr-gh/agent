@@ -1,7 +1,7 @@
 //! Private JSON-lines subprocess protocol for the Discord adapter.
 use crate::{
-    auth,
-    engine::{Frontend, INTERRUPTED, Workspace, text, tools, turn_saved},
+    auth, compaction,
+    engine::{Frontend, INTERRUPTED, Workspace, text, tools, turn_compacting},
     session::{self, Session, Store},
     skills,
 };
@@ -136,11 +136,12 @@ pub(crate) fn run() -> Result<()> {
     session.request.messages.push(text("user", prompt.into()));
     session.save(true)?;
     let store = session.store.as_ref().unwrap();
-    let result = turn_saved(
+    let result = turn_compacting(
         &mut session.request,
         &workspace,
         max_turns,
         4 * 1024 * 1024,
+        compaction::automatic(&client, Some(store), compaction::threshold()?, |_| {}),
         |request| {
             let response = client.run_cancellable(request, &INTERRUPTED, |_| true)?;
             for block in &response.message.content {
@@ -199,7 +200,7 @@ mod tests {
         };
         let mut request = crate::tests::request();
         let mut calls = 0;
-        let error = turn_saved(
+        let error = crate::engine::turn_saved(
             &mut request,
             &workspace,
             max_turns,
