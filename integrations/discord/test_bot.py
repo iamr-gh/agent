@@ -198,9 +198,28 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         stream.feed_eof()
         process = SimpleNamespace(stdout=stream, returncode=1, wait=AsyncMock(return_value=1),
                                   stdin=SimpleNamespace(write=lambda _: None, drain=AsyncMock()))
-        with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=process)):
+        async def spawn(*args, **kwargs):
+            diagnostic = kwargs["stderr"]
+            self.assertEqual(os.stat(diagnostic.name).st_mode & 0o777, 0o600)
+            diagnostic.write(b"synthetic private provider failure")
+            diagnostic.flush()
+            return process
+
+        with patch.object(asyncio, "create_subprocess_exec", AsyncMock(side_effect=spawn)) as launch:
             await self.client.execute(self.thread, "task")
-        self.assertIn("error", self.thread.send.call_args.args[0])
+        diagnostic = launch.call_args.kwargs["stderr"]
+        self.assertTrue(diagnostic.closed)
+        self.assertEqual(Path(diagnostic.name).read_text(), "synthetic private provider failure")
+        message = self.thread.send.call_args.args[0]
+        self.assertIn("worker exit 1", message)
+        self.assertIn(Path(diagnostic.name).name, message)
+        self.assertNotIn("synthetic private provider failure", str(self.thread.send.call_args_list))
+
+    async def test_worker_launch_failure_closes_private_diagnostic(self):
+        with patch.object(asyncio, "create_subprocess_exec", AsyncMock(side_effect=OSError("synthetic"))) as launch:
+            await self.client.execute(self.thread, "task")
+        self.assertTrue(launch.call_args.kwargs["stderr"].closed)
+        self.assertIn("Discord/worker error", self.thread.send.call_args.args[0])
 
     async def test_cancellation_interrupts_worker_and_denies_approval(self):
         stream = asyncio.StreamReader()

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import sqlite3
+import tempfile
 
 import discord
 from discord import app_commands
@@ -186,16 +187,21 @@ class AgentBot(discord.Client):
     async def execute(self, thread, prompt):
         process = None
         view = None
+        diagnostic = None
         try:
             saved, auto_approve, max_turns = self.db.execute(
                 "SELECT session, auto_approve, max_turns FROM sessions WHERE thread=?", (thread.id,)).fetchone()
             if auto_approve not in (0, 1) or not isinstance(max_turns, int) or not 1 <= max_turns <= 100:
                 raise ValueError("Invalid saved permission policy")
+            # Private per-turn file avoids stderr pipe deadlocks and retains provider
+            # diagnostics locally without ever sending their contents to Discord.
+            diagnostic = tempfile.NamedTemporaryFile(
+                prefix=f"worker-{thread.id}-", suffix=".log", dir=STATE, delete=False,
+            )
             process = await asyncio.create_subprocess_exec(
                 str(BINARY), "--discord-worker", cwd=WORKSPACE, env=worker_env(),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                # Provider errors may include sensitive details: never upload them.
-                stderr=asyncio.subprocess.DEVNULL, limit=2 * 1024 * 1024,
+                stderr=diagnostic, limit=2 * 1024 * 1024,
             )
             process.stdin.write((json.dumps({"prompt": prompt, "session": saved,
                                              "auto_approve": bool(auto_approve), "max_turns": max_turns}) + "\n").encode())
@@ -240,7 +246,8 @@ class AgentBot(discord.Client):
                 await thread.send(f"Stopped at the {max_turns}-model-call cap. Completed changes remain; reply to continue with a fresh budget.")
                 return
             await thread.send("Turn complete. Reply here to continue." if done and code == 0 else
-                              "Turn stopped with an error. Saved context is retained; inspect local state before retrying. Check local provider credentials if no response appeared.")
+                              f"Turn stopped with an error (worker exit {code}). Saved context is retained; inspect local state before retrying. "
+                              f"Private local diagnostic: ~/.agent/discord/{Path(diagnostic.name).name} (not uploaded).")
         except asyncio.CancelledError:
             try:
                 await thread.send("Cancelled. Effects may remain; inspect state before retrying.")
@@ -268,6 +275,8 @@ class AgentBot(discord.Client):
                 except asyncio.TimeoutError:
                     process.kill()
                     await process.wait()
+            if diagnostic is not None:
+                diagnostic.close()
 
 
 if __name__ == "__main__":
