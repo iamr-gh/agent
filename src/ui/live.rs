@@ -219,20 +219,23 @@ impl Screen {
             return out.flush();
         }
         let top = self.height() + 1;
-        let editor_top = (top + 1).min(self.size.1);
-        let slots = self.size.1 - editor_top + 1;
         let width = self.size.0.saturating_sub(1).max(1);
+        // Show the newest queued messages above the draft without changing FIFO order.
+        let queue = self.typing.queued.iter().filter(|line| !line.is_empty());
+        let visible: Vec<_> = queue.rev().take(2).collect();
+        let editor_top = top + visible.len();
+        let slots = self.size.1 - editor_top + 1;
         let text = format!("> {}", self.typing.draft.editor.line);
         let rows = input::wrapped_rows(&text, width);
         let (cursor_row, column) =
             input::wrapped_cursor(&text, 2 + self.typing.draft.editor.cursor, width);
         let start = cursor_row.saturating_sub(slots - 1);
         let end = rows.len().min(start + slots);
-        let label = format!("Working | Enter: queue ({})", self.typing.queued.len());
-        let label = input::wrapped_rows(&label, width).remove(0);
         write!(out, "\x1b[{top};1H\x1b[J")?;
-        if editor_top > top {
-            write!(out, "{label}")?;
+        for (index, line) in visible.into_iter().rev().enumerate() {
+            let safe = super::display(line.trim_end_matches('\n')).replace('\t', " ");
+            let preview = input::wrapped_rows(&format!("Queued: {safe}"), width).remove(0);
+            write!(out, "\x1b[{};1H{preview}", top + index)?;
         }
         for (index, row) in rows[start..end].iter().enumerate() {
             write!(

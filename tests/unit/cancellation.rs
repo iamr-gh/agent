@@ -483,7 +483,8 @@ fn live_queue_is_fifo_and_unfinished_draft_survives_busy_turns() {
     process.send("first\n");
     let (stream, _) = server.request();
     process.send("second\nthird\n界e\u{301} ac\x1b[Db");
-    process.expect("Enter: queue (2)");
+    process.expect("Queued: second");
+    process.expect("Queued: third");
     process.expect("界e\u{301} abc");
     assert!(matches!(server.0.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
     done(stream);
@@ -537,7 +538,7 @@ fn live_typeahead_cannot_answer_an_approval_and_draft_is_restored() {
     process.send("first\n");
     let (stream, _) = server.request();
     process.send("y\nunfinished draft");
-    process.expect("Enter: queue (1)");
+    process.expect("Queued: y");
     process.expect("unfinished draft");
     tool(
         stream,
