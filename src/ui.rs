@@ -72,6 +72,14 @@ impl Frontend for TerminalFrontend {
     fn diagnostic(&self, message: &str) {
         let _ = live::output(&format!("skills: {}\n", display(message)), true);
     }
+
+    fn steering(&self) -> Result<Vec<String>> {
+        live::steering()
+    }
+
+    fn steering_delivered(&self, count: usize) {
+        live::steering_delivered(count);
+    }
 }
 
 pub fn styles_enabled(terminal: bool) -> bool {

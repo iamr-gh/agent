@@ -561,6 +561,106 @@ fn live_typeahead_cannot_answer_an_approval_and_draft_is_restored() {
 }
 
 #[test]
+fn tab_promotes_visible_pending_and_skips_tools_after_the_running_request() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    process.send("first\n");
+    let (stream, _) = server.request();
+    process.send("deferred\nnew direction\n\x1b[A\t");
+    process.expect("Steering pending: new direction");
+    assert!(matches!(server.0.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    // Steering must neither cancel this request nor execute its now-stale tool.
+    tool(
+        stream,
+        "write_file",
+        json!({"path":"stale", "content":"bad"}),
+    );
+    let (stream, body) = server.request();
+    assert_user_text(&body, "new direction\n");
+    assert!(body.to_string().contains("superseded by user steering"));
+    assert!(!fixture.0.root.join("stale").exists());
+    process.expect("Delivered: new direction");
+    done(stream);
+    let (stream, body) = server.request();
+    assert_user_text(&body, "deferred\n");
+    done(stream);
+    process.expect("> ");
+    process.quit();
+}
+
+#[test]
+fn draft_steering_waits_for_running_shell_and_skips_the_rest_of_its_batch() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    process.send("first\n");
+    let (stream, _) = server.request();
+    complete(
+        stream,
+        json!([
+            {"type":"function_call","id":"f1","call_id":"running","name":"shell",
+             "arguments":json!({"command":"printf started > started; while [ ! -f release ]; do sleep 0.01; done; printf completed > completed"}).to_string()},
+            {"type":"function_call","id":"f2","call_id":"stale","name":"write_file",
+             "arguments":json!({"path":"stale","content":"bad"}).to_string()}
+        ]),
+    );
+    let deadline = Instant::now() + LIMIT;
+    while !fixture.0.root.join("started").exists() {
+        assert!(Instant::now() < deadline, "shell did not start");
+        thread::sleep(Duration::from_millis(5));
+    }
+    process.send("change direction\t");
+    process.expect("Steering pending: change direction");
+    assert!(matches!(server.0.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    fs::write(fixture.0.root.join("release"), "go").unwrap();
+    let (stream, body) = server.request();
+    assert!(fixture.0.root.join("completed").exists());
+    assert!(!fixture.0.root.join("stale").exists());
+    assert_user_text(&body, "change direction\n");
+    assert!(body.to_string().contains("superseded by user steering"));
+    done(stream);
+    process.expect("> ");
+    process.quit();
+}
+
+#[test]
+fn escape_preserves_queue_and_draft_without_automatic_drain() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    process.send("first\n");
+    let (mut stream, _) = server.request();
+    // Unconsumed steering must also remain paused after Esc.
+    process.send("first pending\nsecond pending\tdraft ac\x1b[Db");
+    process.expect("draft abc");
+    process.send("\x1b");
+    process.expect("pending input preserved");
+    assert_closed(&mut stream);
+    process.expect("Paused");
+    assert!(matches!(server.0.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    // The draft cursor, not just its text, survived Esc. Send it explicitly.
+    process.send("X\n");
+    let (stream, body) = server.request();
+    assert_user_text(&body, "draft abXc\n");
+    done(stream);
+    process.expect("Paused");
+    assert!(matches!(server.0.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    process.send("\x1b[A\t");
+    let (stream, body) = server.request();
+    assert_user_text(&body, "second pending\n");
+    done(stream);
+    process.expect("Paused");
+    assert!(matches!(server.0.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    process.send("\x1b[A\x1b[3~");
+    process.send("/quit\n");
+    assert_eq!(process.wait().code(), Some(0));
+}
+
+#[test]
 fn idle_prompt_interrupt_then_quit() {
     let fixture = Fixture::new();
     let server = Server::new();

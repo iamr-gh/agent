@@ -50,7 +50,7 @@ pub(crate) fn run() -> Result<()> {
                     "/compact summarizes older conversation. Automatic compaction defaults to 128 KiB of message content; set AGENT_COMPACT_KIB=0 to disable it."
                 );
                 println!(
-                    "Interactive terminal: type in the live input area while the agent works; Enter queues a follow-up for after the current turn. Ctrl-C cancels and discards pending input."
+                    "Interactive terminal: Enter queues a visible follow-up; Tab steers at the next model/tool boundary. ↑ from empty input selects pending messages (Tab: steer, e: edit, Delete: remove). Esc interrupts and preserves pending input for selection and sending; Ctrl-C cancels and discards it."
                 );
                 println!(
                     "ag [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.2-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/model opens a searchable model picker; /model ID selects a custom model for the current provider. Switching starts a new saved session; availability depends on your account.\n/resume opens a searchable session picker (↑/↓, Enter, Esc); /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
@@ -419,7 +419,13 @@ fn chat_session(
         if interactive && INTERRUPTED.swap(false, Ordering::Relaxed) {
             session.request.messages.push(text("user", "Previous turn cancelled. Completed tool effects may remain; inspect state before retrying anything.".into()));
             session.save(false)?;
-            eprintln!("cancelled; completed changes were not rolled back");
+            if typing.interrupted() {
+                eprintln!(
+                    "interrupted; completed changes were not rolled back; pending input preserved — select a message or type a continuation"
+                );
+            } else {
+                eprintln!("cancelled; completed changes were not rolled back");
+            }
             continue;
         }
         result?;

@@ -38,6 +38,11 @@ pub(crate) trait Frontend {
         elapsed: Duration,
     );
     fn diagnostic(&self, message: &str);
+    /// Peek pending guidance; acknowledge only after its durable checkpoint.
+    fn steering(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn steering_delivered(&self, _count: usize) {}
 }
 
 pub(crate) fn text(role: &str, value: String) -> Message {
@@ -329,6 +334,35 @@ pub(crate) fn turn(
     )
 }
 
+/// Settle stale calls before inserting guidance, preserving provider replay and
+/// exactly one ordered result per call. Failed checkpoints never acknowledge it.
+fn steer(
+    request: &mut Request,
+    workspace: &Workspace,
+    checkpoint: &mut impl FnMut(&Request) -> Result<()>,
+    remaining: Option<(usize, usize)>,
+) -> Result<bool> {
+    check_interrupt()?;
+    let messages = workspace.frontend.steering()?;
+    check_interrupt()?;
+    if messages.is_empty() {
+        return Ok(false);
+    }
+    if let Some((results, start)) = remaining {
+        for result in &mut request.messages[results].content[start..] {
+            result["output"] = json!("Skipped: superseded by user steering; tool not executed.");
+            result["is_error"] = json!(true);
+        }
+    }
+    let count = messages.len();
+    request
+        .messages
+        .extend(messages.into_iter().map(|message| text("user", message)));
+    checkpoint(request)?;
+    workspace.frontend.steering_delivered(count);
+    Ok(true)
+}
+
 #[cfg(test)]
 pub(crate) fn turn_saved(
     request: &mut Request,
@@ -362,7 +396,7 @@ pub(crate) fn turn_compacting(
     let page_tool_output = crate::tool_history::enabled();
     let mut remaining = max_turns;
     while remaining > 0 {
-        check_interrupt()?;
+        steer(request, workspace, &mut checkpoint, None)?;
         // Leave room for the actual task request. Compaction itself is one model call.
         if remaining > 1 && compact(request)? {
             remaining -= 1;
@@ -394,6 +428,9 @@ pub(crate) fn turn_compacting(
             }
             request.messages.push(response.message);
             checkpoint(request)?;
+            if steer(request, workspace, &mut checkpoint, None)? {
+                continue;
+            }
             return Ok(());
         }
         if calls.is_empty() || calls.len() > 32 {
@@ -412,7 +449,7 @@ pub(crate) fn turn_compacting(
             .iter()
             .map(|call| {
                 json!({"type":"tool_result", "id":call["id"],
-            "output":"Interrupted: tool not executed.", "is_error":true})
+            "output":"Cancelled/interrupted: tool not executed.", "is_error":true})
             })
             .collect();
         request.messages.push(Message {
@@ -423,6 +460,9 @@ pub(crate) fn turn_compacting(
         checkpoint(request)?;
         let results = request.messages.len() - 1;
         for (index, call) in calls.iter().enumerate() {
+            if steer(request, workspace, &mut checkpoint, Some((results, index)))? {
+                break;
+            }
             tool_number += 1;
             let name = call["name"].as_str().unwrap_or("unknown");
             request.messages[results].content[index]["output"] = json!(
@@ -453,6 +493,8 @@ pub(crate) fn turn_compacting(
                 started.elapsed(),
             );
         }
+        // Settle guidance even when the last tool used the final model-call budget.
+        steer(request, workspace, &mut checkpoint, None)?;
     }
     Err("turn limit reached; stopped without another model request".into())
 }
