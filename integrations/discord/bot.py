@@ -234,6 +234,11 @@ class AgentBot(discord.Client):
                         await handle.send({"approve": view.allowed})
                         self.runs.event(thread.id, {"type": "running"})
                         view = None
+                    elif kind in ("quota_paused", "quota_resumed", "quota_login"):
+                        await thread.send(event["message"])
+                    elif kind == "quota_ready":
+                        await self.runs.reserve_after_quota(thread.id)
+                        await handle.send({"resume": True})
                     elif kind == "limit":
                         limited = True
                     elif kind == "done":

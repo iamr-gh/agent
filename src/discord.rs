@@ -8,6 +8,7 @@ use crate::{
 use llm_api::{Provider, Result};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::Duration;
 
 fn emit(value: Value) -> Result<()> {
@@ -18,12 +19,39 @@ fn emit(value: Value) -> Result<()> {
     Ok(())
 }
 
-fn receive() -> Result<Value> {
+fn read_line(input: &mut impl BufRead) -> Result<Option<Value>> {
     let mut line = String::new();
-    if io::stdin().lock().take(1024 * 1024).read_line(&mut line)? == 0 {
-        return Err("adapter disconnected".into());
+    if input.take(1024 * 1024).read_line(&mut line)? == 0 {
+        return Ok(None);
     }
-    Ok(serde_json::from_str(&line)?)
+    if !line.ends_with('\n') {
+        return Err("unterminated or oversized adapter message".into());
+    }
+    Ok(Some(serde_json::from_str(&line)?))
+}
+
+// Only this thread blocks on the pipe. The worker can notice Ctrl-C even when
+// the adapter keeps stdin open without sending an approval or resume grant.
+fn adapter_input() -> Receiver<Result<Value>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut input = io::stdin().lock();
+        loop {
+            match read_line(&mut input) {
+                Ok(Some(value)) => {
+                    if sender.send(Ok(value)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
 }
 
 fn is_approval(answer: &Value) -> bool {
@@ -45,11 +73,23 @@ fn policy(input: &Value) -> Result<(bool, usize)> {
     Ok((auto_approve, max_turns))
 }
 
-struct ProtocolFrontend;
+struct ProtocolFrontend(Receiver<Result<Value>>);
+impl ProtocolFrontend {
+    fn receive(&self) -> Result<Value> {
+        loop {
+            crate::check_interrupt()?;
+            match self.0.recv_timeout(Duration::from_millis(100)) {
+                Ok(value) => return value,
+                Err(RecvTimeoutError::Timeout) => (),
+                Err(RecvTimeoutError::Disconnected) => return Err("adapter disconnected".into()),
+            }
+        }
+    }
+}
 impl Frontend for ProtocolFrontend {
     fn approve(&self, name: &str, args: &Value) -> Result<()> {
         emit(json!({"type":"approval", "name":name, "args":args}))?;
-        let answer = receive()?;
+        let answer = self.receive()?;
         if is_approval(&answer) {
             Ok(())
         } else {
@@ -63,13 +103,36 @@ impl Frontend for ProtocolFrontend {
         let _ = emit(json!({"type":"tool_finished", "index":index, "name":name,
             "error":error, "elapsed_ms":elapsed.as_millis()}));
     }
+    fn quota_status(&self, state: &str, message: &str) -> Result<()> {
+        emit(json!({"type":state, "message":message}))
+    }
+    fn quota_ready(&self) -> Result<()> {
+        emit(json!({"type":"quota_ready"}))?;
+        if self.receive()? != json!({"resume":true}) {
+            return Err("adapter did not grant checkout access".into());
+        }
+        Ok(())
+    }
+    fn quota_check(&self) -> Result<()> {
+        match self.0.try_recv() {
+            Err(TryRecvError::Empty) => Ok(()),
+            Err(TryRecvError::Disconnected) => Err("adapter disconnected".into()),
+            Ok(Err(error)) => Err(error),
+            Ok(Ok(_)) => Err("unexpected adapter message while paused".into()),
+        }
+    }
     fn diagnostic(&self, message: &str) {
         eprintln!("{message}");
     }
 }
 
 pub(crate) fn run() -> Result<()> {
-    let input = receive()?;
+    run_with_connector(runner::connect)
+}
+
+fn run_with_connector(connect: fn(Provider) -> Result<llm_api::Client>) -> Result<()> {
+    let frontend = ProtocolFrontend(adapter_input());
+    let input = frontend.receive()?;
     let prompt = input["prompt"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
@@ -78,7 +141,7 @@ pub(crate) fn run() -> Result<()> {
     let workspace = Workspace {
         root: std::env::current_dir()?.canonicalize()?,
         yes: auto_approve,
-        frontend: Box::new(ProtocolFrontend),
+        frontend: Box::new(frontend),
     };
     let root = session::directory()?;
     let (mut session, provider) = if let Some(id) = input["session"].as_str() {
@@ -96,7 +159,7 @@ pub(crate) fn run() -> Result<()> {
             provider,
         )
     };
-    let client = runner::connect(provider)?;
+    let mut client = connect(provider)?;
     emit(json!({"type":"session", "id":session.store.as_ref().unwrap().id}))?;
     // Presentation belongs to the adapter, not persisted core instructions.
     let presentation = input
@@ -104,6 +167,7 @@ pub(crate) fn run() -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("");
     session.request.messages.push(text("user", prompt.into()));
+    let threshold = compaction::threshold()?;
     session.save(true)?;
     let store = session.store.as_ref().unwrap();
     let result = runner::turn(
@@ -111,8 +175,9 @@ pub(crate) fn run() -> Result<()> {
         &workspace,
         max_turns,
         4 * 1024 * 1024,
-        compaction::automatic(&client, Some(store), compaction::threshold()?, |_| {}),
-        |request| {
+        runner::TurnModel::with_connector(&mut client, Some(store), connect),
+        compaction::automatic(Some(store), threshold, |_| {}),
+        |client, request| {
             let mut presented = request.clone();
             presented.system.push_str(presentation);
             let response = client.run_cancellable(&presented, &INTERRUPTED, |_| true)?;
@@ -125,19 +190,41 @@ pub(crate) fn run() -> Result<()> {
         },
         |request| store.save(request, true),
     );
+    session.save(false)?;
     if let Err(error) = result {
         if error.to_string() != "turn limit reached; stopped without another model request" {
             return Err(error);
         }
         emit(json!({"type":"limit", "max_turns":max_turns}))?;
     }
-    session.save(false)?;
     emit(json!({"type":"done"}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_worker() {
+        if std::env::var_os("AGENT_TEST_WORKER_PORT").is_none() {
+            return;
+        }
+        crate::install_interrupt_handler();
+        let result = run_with_connector(|provider| {
+            assert_eq!(provider, Provider::Codex);
+            let port: u16 = std::env::var("AGENT_TEST_WORKER_PORT")?.parse()?;
+            llm_api::Client::codex("synthetic-token", "synthetic-account")?
+                .with_endpoint(format!("http://127.0.0.1:{port}/responses"))
+        });
+        if let Err(error) = &result {
+            eprintln!("worker: {error}");
+        }
+        std::process::exit(if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            130
+        } else {
+            i32::from(result.is_err())
+        });
+    }
 
     #[test]
     fn worker_policy_defaults_fail_closed_and_bounds_turns() {
@@ -168,7 +255,7 @@ mod tests {
         let workspace = Workspace {
             root: std::env::current_dir().unwrap(),
             yes,
-            frontend: Box::new(ProtocolFrontend),
+            frontend: Box::new(ProtocolFrontend(mpsc::channel().1)),
         };
         let mut request = crate::tests::request();
         let mut calls = 0;

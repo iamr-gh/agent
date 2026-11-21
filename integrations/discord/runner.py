@@ -15,22 +15,51 @@ class Runs:
     """One writer per session and checkout, reserved before the first await."""
     def __init__(self):
         self.active = {}
+        self.changed = asyncio.Event()
+
+    def checkout_busy(self, workspace, exclude=None):
+        return any(key != exclude and run["workspace"] == workspace and run["owns_checkout"]
+                   for key, run in self.active.items())
+
+    def checkout_released(self):
+        self.changed.set()
+        self.changed = asyncio.Event()
 
     async def submit(self, key, workspace, operation):
         workspace = Path(workspace).resolve(strict=True)
         if key in self.active:
             raise Busy("This session already has an active turn.")
-        if any(run["workspace"] == workspace for run in self.active.values()):
+        if self.checkout_busy(workspace):
             raise Busy("Workspace busy. Wait or select a separate directory/Git worktree.")
-        self.active[key] = {"task": asyncio.current_task(), "workspace": workspace, "state": "running"}
+        self.active[key] = {"task": asyncio.current_task(), "workspace": workspace,
+                            "state": "running", "owns_checkout": True}
         try:
             return await operation()
         finally:
-            self.active.pop(key, None)
+            if self.active.pop(key)["owns_checkout"]:
+                self.checkout_released()
 
     def event(self, key, event):
-        if key in self.active:
-            self.active[key]["state"] = "awaiting approval" if event["type"] == "approval" else "running"
+        run = self.active.get(key)
+        if run is None:
+            return
+        kind = event["type"]
+        if kind == "quota_paused":
+            run["owns_checkout"] = False
+            run["state"] = "paused for Codex usage limit"
+            self.checkout_released()
+        elif kind == "quota_login":
+            run["state"] = "Codex login unavailable"
+        elif kind != "quota_ready":
+            run["state"] = "awaiting approval" if kind == "approval" else "running"
+
+    async def reserve_after_quota(self, key):
+        run = self.active[key]
+        run["state"] = "waiting for checkout after Codex usage limit"
+        while self.checkout_busy(run["workspace"], key):
+            await self.changed.wait()
+        run["owns_checkout"] = True
+        run["state"] = "reacquiring checkout after Codex usage limit"
 
     def status(self, key):
         run = self.active.get(key)

@@ -73,6 +73,11 @@ impl Frontend for TerminalFrontend {
         let _ = live::output(&format!("skills: {}\n", display(message)), true);
     }
 
+    fn quota_status(&self, _state: &str, message: &str) -> Result<()> {
+        live::output(&format!("{}\n", display(message)), true)?;
+        Ok(())
+    }
+
     fn steering(&self) -> Result<Vec<String>> {
         live::steering()
     }

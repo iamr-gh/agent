@@ -3,7 +3,7 @@ use super::{StreamDisplay, TerminalFrontend, input, live, styles_enabled};
 use crate::{
     INTERRUPTED, Workspace, check_interrupt, compaction,
     engine::text,
-    runner::{connect, turn as turn_compacting},
+    runner::{TurnModel, connect, turn as turn_compacting},
     session::{self, Session, Store},
     skills,
 };
@@ -343,26 +343,35 @@ fn chat_session(
             &workspace,
             max_turns,
             max_context_bytes,
-            compaction::automatic(
-                &client,
-                store.as_ref(),
-                compact_threshold,
-                compaction_notice,
-            ),
-            |req| {
+            TurnModel::new(&mut client, store.as_ref()),
+            compaction::automatic(store.as_ref(), compact_threshold, compaction_notice),
+            |client, req| {
                 let styled = styles_enabled(io::stdout().is_terminal());
                 let mut stream = StreamDisplay::new(styled);
+                let mut displayed = false;
                 let result = client.run_cancellable(req, &INTERRUPTED, |event| {
                     if check_interrupt().is_err() {
                         return false;
                     }
                     let chunk = stream.delta(&event);
                     if !chunk.is_empty() {
+                        displayed = true;
                         return live::output(&chunk, false).is_ok();
                     }
                     true
                 });
-                live::output(&stream.finish(), false)?;
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<llm_api::CodexQuota>())
+                {
+                    // Already printed deltas cannot be retracted. Do not flush any
+                    // buffered text, and mark the visible part as discarded.
+                    if displayed {
+                        live::output("\n[Partial model output discarded]\n", false)?;
+                    }
+                } else {
+                    live::output(&stream.finish(), false)?;
+                }
                 result
             },
             |request| {

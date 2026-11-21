@@ -180,13 +180,12 @@ pub(crate) fn manual(
 }
 
 pub(crate) fn automatic<'a>(
-    client: &'a Client,
     store: Option<&'a Store>,
     threshold: usize,
     notify: impl Fn(&str) + 'a,
-) -> impl FnMut(&mut Request) -> Result<bool> + 'a {
+) -> impl FnMut(&Client, &mut Request) -> Result<bool> + 'a {
     let mut failed = false;
-    move |request| {
+    move |client, request| {
         if failed
             || threshold == 0
             || request.messages.len() < KEEP + 2
@@ -199,7 +198,9 @@ pub(crate) fn automatic<'a>(
         };
         match summarize(client, request, plan) {
             Ok(candidate) => notify(&commit(request, candidate, store, true)?),
-            Err(error) if error.is::<Cancelled>() => return Err(error),
+            Err(error) if error.is::<Cancelled>() || error.is::<llm_api::CodexQuota>() => {
+                return Err(error);
+            }
             Err(error) => {
                 failed = true;
                 notify(&format!("Automatic compaction skipped: {error}"));
@@ -304,7 +305,7 @@ mod tests {
                 summaries.set(summaries.get() + 1);
                 Ok(true)
             },
-            |request| {
+            |_, request| {
                 calls.set(calls.get() + 1);
                 if calls.get() == 1 {
                     Ok(response(

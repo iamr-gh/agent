@@ -38,6 +38,16 @@ pub(crate) trait Frontend {
         elapsed: Duration,
     );
     fn diagnostic(&self, message: &str);
+    fn quota_status(&self, _state: &str, message: &str) -> Result<()> {
+        self.diagnostic(message);
+        Ok(())
+    }
+    fn quota_ready(&self) -> Result<()> {
+        Ok(())
+    }
+    fn quota_check(&self) -> Result<()> {
+        Ok(())
+    }
     /// Peek pending guidance; acknowledge only after its durable checkpoint.
     fn steering(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
@@ -369,7 +379,7 @@ pub(crate) fn turn_saved(
     workspace: &Workspace,
     max_turns: usize,
     max_context_bytes: usize,
-    infer: impl FnMut(&Request) -> Result<Response>,
+    mut infer: impl FnMut(&Request) -> Result<Response>,
     checkpoint: impl FnMut(&Request) -> Result<()>,
 ) -> Result<()> {
     turn_compacting(
@@ -378,7 +388,7 @@ pub(crate) fn turn_saved(
         max_turns,
         max_context_bytes,
         |_| Ok(false),
-        infer,
+        |_, input| infer(input),
         checkpoint,
     )
 }
@@ -389,7 +399,7 @@ pub(crate) fn turn_compacting(
     max_turns: usize,
     max_context_bytes: usize,
     mut compact: impl FnMut(&mut Request) -> Result<bool>,
-    mut infer: impl FnMut(&Request) -> Result<Response>,
+    mut infer: impl FnMut(&Request, &Request) -> Result<Response>,
     mut checkpoint: impl FnMut(&Request) -> Result<()>,
 ) -> Result<()> {
     let mut tool_number = 0;
@@ -409,7 +419,7 @@ pub(crate) fn turn_compacting(
         let projected = page_tool_output
             .then(|| crate::tool_history::project(request))
             .flatten();
-        let response = infer(projected.as_ref().unwrap_or(request))?;
+        let response = infer(request, projected.as_ref().unwrap_or(request))?;
         check_interrupt()?;
         let calls: Vec<_> = response
             .message

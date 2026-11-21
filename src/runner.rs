@@ -6,9 +6,17 @@ use crate::{
     session::{self, Session, Store},
     skills,
 };
-use llm_api::{Client, Provider, Request, Response, Result};
+use llm_api::{Cancelled, Client, CodexQuota, Provider, Request, Response, Result};
 use serde_json::json;
-use std::{fs::File, os::fd::AsRawFd, path::Path};
+use std::{
+    cell::RefCell,
+    fs::File,
+    io,
+    os::fd::AsRawFd,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 pub(crate) fn connect(provider: Provider) -> Result<Client> {
     if provider == Provider::Codex {
@@ -67,37 +75,174 @@ pub(crate) struct WorkspaceLease {
 }
 impl WorkspaceLease {
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
+        Self::try_acquire(root)?.ok_or_else(|| "workspace busy: another agent turn owns this checkout; wait or select a separate directory/Git worktree".into())
+    }
+
+    fn try_acquire(root: &Path) -> Result<Option<Self>> {
         let directory = File::open(root)?;
         if !directory.metadata()?.is_dir() {
             return Err("workspace must be a directory".into());
         }
         // SAFETY: directory is a live owned descriptor. Nonblocking, advisory lock.
         if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("workspace busy: another agent turn owns this checkout; wait or select a separate directory/Git worktree".into());
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
         }
-        Ok(Self {
+        Ok(Some(Self {
             _directory: directory,
-        })
+        }))
     }
 }
 
+pub(crate) struct TurnModel<'a> {
+    client: &'a mut Client,
+    store: Option<&'a Store>,
+    reload: fn(Provider) -> Result<Client>,
+}
+
+impl<'a> TurnModel<'a> {
+    pub(crate) fn new(client: &'a mut Client, store: Option<&'a Store>) -> Self {
+        Self::with_connector(client, store, connect)
+    }
+
+    pub(crate) fn with_connector(
+        client: &'a mut Client,
+        store: Option<&'a Store>,
+        reload: fn(Provider) -> Result<Client>,
+    ) -> Self {
+        Self {
+            client,
+            store,
+            reload,
+        }
+    }
+}
+
+struct ActiveTurn<'a> {
+    model: TurnModel<'a>,
+    workspace: &'a Workspace,
+    lease: Option<WorkspaceLease>,
+}
+
+fn wait_until(
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    check_frontend: impl Fn() -> Result<()>,
+) -> Result<()> {
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(Cancelled.into());
+        }
+        check_frontend()?;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(());
+        };
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+impl ActiveTurn<'_> {
+    fn pause(&mut self, request: &Request, quota: &CodexQuota) -> Result<()> {
+        let reported = quota.reset_after();
+        let delay = reported.unwrap_or(Duration::from_secs(5 * 3600));
+        let deadline = Instant::now() + delay;
+        if let Some(store) = self.model.store {
+            store.save(request, false)?;
+        }
+        self.lease.take();
+        let timing = if reported.is_some() {
+            format!("provider reset in {} seconds", delay.as_secs())
+        } else {
+            "retrying in 5 hours (fallback; provider did not report a reset)".into()
+        };
+        self.workspace.frontend.quota_status(
+            "quota_paused",
+            &format!("Codex subscription usage limit reached. Paused: {timing}. The pending model call will retry automatically; completed tools won't replay."),
+        )?;
+        let check_frontend = || self.workspace.frontend.quota_check();
+        wait_until(deadline, &engine::INTERRUPTED, check_frontend)?;
+        // Discord reserves the checkout in its scheduler before Rust reacquires it.
+        self.workspace.frontend.quota_ready()?;
+        loop {
+            engine::check_interrupt()?;
+            check_frontend()?;
+            if let Some(lease) = WorkspaceLease::try_acquire(&self.workspace.root)? {
+                self.lease = Some(lease);
+                break;
+            }
+            wait_until(
+                Instant::now() + Duration::from_millis(250),
+                &engine::INTERRUPTED,
+                check_frontend,
+            )?;
+        }
+        engine::check_interrupt()?;
+        *self.model.client = match (self.model.reload)(Provider::Codex) {
+            Ok(client) => client,
+            Err(_) => {
+                let message = "Could not reload the Codex login after the quota wait. Renew it through its login owner before continuing. Saved context and completed tool results were retained.";
+                self.workspace
+                    .frontend
+                    .quota_status("quota_login", message)?;
+                return Err(message.into());
+            }
+        };
+        self.workspace.frontend.quota_status(
+            "quota_resumed",
+            "Codex quota wait ended. Retrying the pending model call.",
+        )?;
+        if let Some(store) = self.model.store {
+            store.save(request, true)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn turn(
     request: &mut Request,
     workspace: &Workspace,
     max_turns: usize,
     max_context_bytes: usize,
-    compact: impl FnMut(&mut Request) -> Result<bool>,
-    infer: impl FnMut(&Request) -> Result<Response>,
+    model: TurnModel<'_>,
+    mut compact: impl FnMut(&Client, &mut Request) -> Result<bool>,
+    mut infer: impl FnMut(&Client, &Request) -> Result<Response>,
     checkpoint: impl FnMut(&Request) -> Result<()>,
 ) -> Result<()> {
-    let _lease = WorkspaceLease::acquire(&workspace.root)?;
+    let state = RefCell::new(ActiveTurn {
+        model,
+        workspace,
+        lease: Some(WorkspaceLease::acquire(&workspace.root)?),
+    });
     engine::turn_compacting(
         request,
         workspace,
         max_turns,
         max_context_bytes,
-        compact,
-        infer,
+        |request| loop {
+            engine::check_interrupt()?;
+            let mut state = state.borrow_mut();
+            match compact(state.model.client, request) {
+                Err(error) if error.is::<CodexQuota>() => {
+                    state.pause(request, error.downcast_ref::<CodexQuota>().unwrap())?;
+                }
+                result => return result,
+            }
+        },
+        |settled, projected| loop {
+            engine::check_interrupt()?;
+            let mut state = state.borrow_mut();
+            match infer(state.model.client, projected) {
+                Err(error) if error.is::<CodexQuota>() => {
+                    state.pause(settled, error.downcast_ref::<CodexQuota>().unwrap())?;
+                }
+                result => return result,
+            }
+        },
         checkpoint,
     )
 }
@@ -127,8 +272,9 @@ mod tests {
             &fixture.0,
             1,
             1024 * 1024,
-            |_| panic!("busy checkout must not compact"),
-            |_| panic!("busy checkout must not infer"),
+            TurnModel::new(&mut Client::new(Provider::Openai, "dummy"), None),
+            |_, _| panic!("busy checkout must not compact"),
+            |_, _| panic!("busy checkout must not infer"),
             |_| Ok(()),
         );
         assert!(result.unwrap_err().to_string().contains("workspace busy"));
@@ -139,8 +285,9 @@ mod tests {
                 &fixture.0,
                 1,
                 1024 * 1024,
-                |_| Ok(false),
-                |_| Err("synthetic provider failure".into()),
+                TurnModel::new(&mut Client::new(Provider::Openai, "dummy"), None),
+                |_, _| Ok(false),
+                |_, _| Err("synthetic provider failure".into()),
                 |_| Ok(())
             )
             .is_err()
@@ -150,8 +297,9 @@ mod tests {
             &fixture.0,
             1,
             1024 * 1024,
-            |_| Ok(false),
-            |_| Ok(response(vec![], "stop")),
+            TurnModel::new(&mut Client::new(Provider::Openai, "dummy"), None),
+            |_, _| Ok(false),
+            |_, _| Ok(response(vec![], "stop")),
             |_| Ok(()),
         )
         .unwrap();
