@@ -4,9 +4,9 @@ import io
 import json
 import os
 from pathlib import Path
-import signal
 import sqlite3
-import tempfile
+
+from runner import Busy, Runs, worker
 
 import discord
 from discord import app_commands
@@ -73,8 +73,7 @@ class AgentBot(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
-        self.active = None
-        self.active_thread = None
+        self.runs = Runs()
         STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(STATE / "state.sqlite3")
         self.db.execute("CREATE TABLE IF NOT EXISTS sessions (thread INTEGER PRIMARY KEY, session TEXT)")
@@ -84,17 +83,20 @@ class AgentBot(discord.Client):
             self.db.execute("ALTER TABLE sessions ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0")
         if "max_turns" not in columns:
             self.db.execute("ALTER TABLE sessions ADD COLUMN max_turns INTEGER NOT NULL DEFAULT 25")
+        if "workspace" not in columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN workspace TEXT")
         self.db.execute("CREATE TABLE IF NOT EXISTS seen (id INTEGER PRIMARY KEY)")
         self.db.commit()
-        self.tree.command(name="agent", description="Start an agent thread in the local agent repository")(self.start_session)
-        self.tree.command(name="agent_stop", description="Cancel the active agent turn")(self.stop_turn)
+        self.tree.command(name="agent", description="Start an agent thread in an existing local workspace")(self.start_session)
+        self.tree.command(name="agent_stop", description="Cancel this thread's active agent turn")(self.stop_turn)
         self.tree.command(name="agent_settings", description="Set approval mode and per-prompt model-call cap for this thread")(self.settings)
+        self.tree.command(name="agent_status", description="Show this session's run status and workspace")(self.status)
 
     async def setup_hook(self):
         await self.tree.sync()
 
     async def on_ready(self):
-        print("Discord bot connected; /agent and /agent_stop registered.", flush=True)
+        print("Discord bot connected; /agent, /agent_stop, /agent_status, /agent_settings registered.", flush=True)
 
     def seen(self, event_id):
         inserted = self.db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (event_id,)).rowcount
@@ -104,30 +106,32 @@ class AgentBot(discord.Client):
     @app_commands.describe(auto_approve="Allow shell and file changes without buttons (full local privileges)",
                            max_turns="Maximum model calls per prompt, not a tool-call or cost cap (1–100)")
     async def start_session(self, interaction: discord.Interaction, prompt: str,
-                            auto_approve: bool = True, max_turns: app_commands.Range[int, 1, 100] = 25):
+                            auto_approve: bool = True, max_turns: app_commands.Range[int, 1, 100] = 25,
+                            workspace: str = ""):
         if interaction.user.id != OWNER_ID or interaction.guild is None:
             await interaction.response.send_message("Not authorized; use your server.", ephemeral=True)
             return
         if self.seen(interaction.id):
             await interaction.response.send_message("Already received.", ephemeral=True)
             return
-        if self.active is not None or not isinstance(interaction.channel, discord.TextChannel):
-            await interaction.response.send_message("Agent busy, or this is not a text channel.", ephemeral=True)
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("Use a text channel.", ephemeral=True)
             return
-        # Reserve synchronously before any await so simultaneous commands cannot race.
-        self.active = asyncio.current_task()
         try:
-            await interaction.response.send_message("Starting a local agent session…")
-            message = await interaction.original_response()
-            thread = await message.create_thread(name="Agent session", auto_archive_duration=1440)
-            self.db.execute("INSERT INTO sessions (thread, session, auto_approve, max_turns) VALUES (?, NULL, ?, ?)",
-                            (thread.id, int(auto_approve), max_turns))
-            self.db.commit()
-            self.active_thread = thread.id
-            await self.execute(thread, prompt)
-        finally:
-            self.active = None
-            self.active_thread = None
+            root = Path(workspace).expanduser() if workspace else WORKSPACE
+            if not root.is_absolute() or not root.is_dir():
+                raise ValueError("Workspace must be an existing absolute directory.")
+            root = root.resolve(strict=True)
+        except (OSError, ValueError) as error:
+            await interaction.response.send_message(str(error), ephemeral=True)
+            return
+        await interaction.response.send_message("Starting a local agent session…")
+        message = await interaction.original_response()
+        thread = await message.create_thread(name="Agent session", auto_archive_duration=1440)
+        self.db.execute("INSERT INTO sessions (thread, session, auto_approve, max_turns, workspace) VALUES (?, NULL, ?, ?, ?)",
+                        (thread.id, int(auto_approve), max_turns, str(root)))
+        self.db.commit()
+        await self.submit(thread, prompt)
 
     @app_commands.describe(auto_approve="Allow shell and file changes without buttons (full local privileges)",
                            max_turns="Maximum model calls per prompt (1–100); resets on each reply")
@@ -140,7 +144,7 @@ class AgentBot(discord.Client):
         if not self.db.execute("SELECT 1 FROM sessions WHERE thread=?", (thread_id,)).fetchone():
             await interaction.response.send_message("Use this command inside an agent thread.", ephemeral=True)
             return
-        if self.active_thread == thread_id:
+        if self.runs.status(thread_id) != "idle":
             await interaction.response.send_message("Wait for this turn to finish or cancel it before changing settings.", ephemeral=True)
             return
         self.db.execute("UPDATE sessions SET auto_approve=?, max_turns=? WHERE thread=?",
@@ -158,96 +162,89 @@ class AgentBot(discord.Client):
             return
         if self.seen(message.id):
             return
-        if self.active is not None:
-            await message.channel.send("Agent busy. Wait for completion or use /agent_stop, then resend.")
-            return
-        self.active = asyncio.current_task()
-        self.active_thread = message.channel.id
+        await self.submit(message.channel, message.content)
+
+    async def submit(self, thread, prompt):
+        row = self.db.execute("SELECT workspace FROM sessions WHERE thread=?", (thread.id,)).fetchone()
         try:
-            await self.execute(message.channel, message.content)
-        finally:
-            self.active = None
-            self.active_thread = None
+            await self.runs.submit(thread.id, row[0] or WORKSPACE, lambda: self.execute(thread, prompt))
+        except (Busy, OSError) as error:
+            await thread.send(f"Not started: {error} Resend when ready.")
+
+    async def status(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID or interaction.guild is None:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        row = self.db.execute("SELECT workspace FROM sessions WHERE thread=?", (interaction.channel_id,)).fetchone()
+        text = (f"{self.runs.status(interaction.channel_id)} · {row[0] or WORKSPACE}" if row
+                else "Use this command inside an agent thread.")
+        await interaction.response.send_message(text, ephemeral=True)
 
     async def stop_turn(self, interaction: discord.Interaction):
         if interaction.user.id != OWNER_ID or interaction.guild is None:
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
-        if self.active is not None:
-            self.active.cancel()
-            await interaction.response.send_message("Cancelling. Completed changes are not rolled back.", ephemeral=True)
+        if self.runs.cancel(interaction.channel_id):
+            await interaction.response.send_message("Cancelling this thread. Completed changes are not rolled back.", ephemeral=True)
         else:
             await interaction.response.send_message("No active turn.", ephemeral=True)
 
     async def on_disconnect(self):
         # No unobserved work or pending approval survives loss of Discord connectivity.
-        if self.active is not None:
-            self.active.cancel()
+        self.runs.cancel_all()
 
     async def execute(self, thread, prompt):
-        process = None
         view = None
-        diagnostic = None
         try:
-            saved, auto_approve, max_turns = self.db.execute(
-                "SELECT session, auto_approve, max_turns FROM sessions WHERE thread=?", (thread.id,)).fetchone()
+            saved, auto_approve, max_turns, workspace = self.db.execute(
+                "SELECT session, auto_approve, max_turns, workspace FROM sessions WHERE thread=?", (thread.id,)).fetchone()
             if auto_approve not in (0, 1) or not isinstance(max_turns, int) or not 1 <= max_turns <= 100:
                 raise ValueError("Invalid saved permission policy")
-            # Private per-turn file avoids stderr pipe deadlocks and retains provider
-            # diagnostics locally without ever sending their contents to Discord.
-            diagnostic = tempfile.NamedTemporaryFile(
-                prefix=f"worker-{thread.id}-", suffix=".log", dir=STATE, delete=False,
-            )
-            process = await asyncio.create_subprocess_exec(
-                str(BINARY), "--discord-worker", cwd=WORKSPACE, env=worker_env(),
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=diagnostic, limit=2 * 1024 * 1024,
-            )
-            process.stdin.write((json.dumps({"prompt": prompt, "session": saved,
-                                             "auto_approve": bool(auto_approve), "max_turns": max_turns}) + "\n").encode())
-            await process.stdin.drain()
-            mode = "auto approvals — full local privileges" if auto_approve else "approval buttons"
-            await thread.send(f"Working · {mode} · max {max_turns} model calls. Not a sandbox.")
-            done = False
-            limited = False
-            while line := await process.stdout.readline():
-                event = json.loads(line)
-                kind = event.get("type")
-                if kind == "session":
-                    self.db.execute("UPDATE sessions SET session=? WHERE thread=?", (event["id"], thread.id))
-                    self.db.commit()
-                elif kind == "answer":
-                    answer = event.get("text", "")
-                    if answer:
-                        if len(answer) > 1800:
-                            await thread.send("Agent response:", file=discord.File(io.BytesIO(answer.encode()), filename="answer.txt"))
-                        else:
-                            await thread.send(answer)
-                elif kind == "approval":
-                    view = Approval()
-                    arguments = json.dumps({"tool": event["name"], "arguments": event["args"]}, indent=2, ensure_ascii=False)
-                    message = await thread.send(
-                        "Allow this exact action with this machine's user privileges? Review the attached complete arguments. Expires in 2 minutes.",
-                        file=discord.File(io.BytesIO(arguments.encode()), filename="approval.json"), view=view,
-                    )
-                    await view.wait()
-                    for child in view.children:
-                        child.disabled = True
-                    await message.edit(content="Approved." if view.allowed else "Denied or expired.", view=view)
-                    process.stdin.write((json.dumps({"approve": view.allowed}) + "\n").encode())
-                    await process.stdin.drain()
-                    view = None
-                elif kind == "limit":
-                    limited = True
-                elif kind == "done":
-                    done = True
-            code = await process.wait()
-            if limited and done and code == 0:
-                await thread.send(f"Stopped at the {max_turns}-model-call cap. Completed changes remain; reply to continue with a fresh budget.")
-                return
-            await thread.send("Turn complete. Reply here to continue." if done and code == 0 else
-                              f"Turn stopped with an error (worker exit {code}). Saved context is retained; inspect local state before retrying. "
-                              f"Private local diagnostic: ~/.agent/discord/{Path(diagnostic.name).name} (not uploaded).")
+            payload = {"prompt": prompt, "session": saved, "auto_approve": bool(auto_approve), "max_turns": max_turns,
+                       "presentation": "\nDiscord presentation: give a concise final answer summarizing changes, checks, and blockers. Avoid tool-by-tool narration. Prefer under 200 words unless the user requests detail. Never omit important failures or risks."}
+            async with worker(BINARY, workspace or WORKSPACE, worker_env(), STATE, thread.id, payload) as handle:
+                mode = "auto approvals — full local privileges" if auto_approve else "approval buttons"
+                await thread.send(f"Working · {mode} · max {max_turns} model calls. Not a sandbox.")
+                done = False
+                limited = False
+                async for event in handle.events():
+                    self.runs.event(thread.id, event)
+                    kind = event.get("type")
+                    if kind == "session":
+                        self.db.execute("UPDATE sessions SET session=? WHERE thread=?", (event["id"], thread.id))
+                        self.db.commit()
+                    elif kind == "answer":
+                        answer = event.get("text", "")
+                        if answer:
+                            if len(answer) > 1800:
+                                await thread.send("Agent response:", file=discord.File(io.BytesIO(answer.encode()), filename="answer.txt"))
+                            else:
+                                await thread.send(answer)
+                    elif kind == "approval":
+                        view = Approval()
+                        arguments = json.dumps({"tool": event["name"], "arguments": event["args"]}, indent=2, ensure_ascii=False)
+                        message = await thread.send(
+                            "Allow this exact action with this machine's user privileges? Review the attached complete arguments. Expires in 2 minutes.",
+                            file=discord.File(io.BytesIO(arguments.encode()), filename="approval.json"), view=view,
+                        )
+                        await view.wait()
+                        for child in view.children:
+                            child.disabled = True
+                        await message.edit(content="Approved." if view.allowed else "Denied or expired.", view=view)
+                        await handle.send({"approve": view.allowed})
+                        self.runs.event(thread.id, {"type": "running"})
+                        view = None
+                    elif kind == "limit":
+                        limited = True
+                    elif kind == "done":
+                        done = True
+                code = await handle.process.wait()
+                if limited and done and code == 0:
+                    await thread.send(f"Stopped at the {max_turns}-model-call cap. Completed changes remain; reply to continue with a fresh budget.")
+                    return
+                await thread.send("Turn complete. Reply here to continue." if done and code == 0 else
+                                  f"Turn stopped with an error (worker exit {code}). Saved context is retained; inspect local state before retrying. "
+                                  f"Private local diagnostic: ~/.agent/discord/{Path(handle.diagnostic.name).name} (not uploaded).")
         except asyncio.CancelledError:
             try:
                 await thread.send("Cancelled. Effects may remain; inspect state before retrying.")
@@ -262,21 +259,6 @@ class AgentBot(discord.Client):
         finally:
             if view is not None:
                 view.stop()
-            if process is not None and process.returncode is None:
-                process.send_signal(signal.SIGINT)
-                # Unblock a worker waiting for approval, always denying it.
-                try:
-                    process.stdin.write(b'{"approve":false}\n')
-                    await process.stdin.drain()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-            if diagnostic is not None:
-                diagnostic.close()
 
 
 if __name__ == "__main__":

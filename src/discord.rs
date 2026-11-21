@@ -1,11 +1,11 @@
-//! Private JSON-lines subprocess protocol for the Discord adapter.
+//! Frontend-neutral JSON-lines subprocess protocol (legacy filename).
 use crate::{
-    auth, compaction,
-    engine::{Frontend, INTERRUPTED, Workspace, text, tools, turn_compacting},
-    session::{self, Session, Store},
-    skills,
+    compaction,
+    engine::{Frontend, INTERRUPTED, Workspace, text},
+    runner,
+    session::{self, Store},
 };
-use llm_api::{Client, Provider, Request, Result};
+use llm_api::{Provider, Result};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 use std::time::Duration;
@@ -30,8 +30,6 @@ fn is_approval(answer: &Value) -> bool {
     answer == &json!({"approve":true})
 }
 
-const COMPACT_INSTRUCTIONS: &str = "\nDiscord presentation: give a concise final answer summarizing changes, checks, and blockers. Avoid tool-by-tool narration. Prefer under 200 words unless the user requests detail. Never omit important failures or risks.";
-
 fn policy(input: &Value) -> Result<(bool, usize)> {
     let auto_approve = match input.get("auto_approve") {
         None => false,
@@ -47,22 +45,27 @@ fn policy(input: &Value) -> Result<(bool, usize)> {
     Ok((auto_approve, max_turns))
 }
 
-struct DiscordFrontend;
-impl Frontend for DiscordFrontend {
+struct ProtocolFrontend;
+impl Frontend for ProtocolFrontend {
     fn approve(&self, name: &str, args: &Value) -> Result<()> {
         emit(json!({"type":"approval", "name":name, "args":args}))?;
         let answer = receive()?;
         if is_approval(&answer) {
             Ok(())
         } else {
-            Err("denied by Discord user or approval expired".into())
+            Err("denied by frontend or approval expired".into())
         }
     }
     fn tool_started(&self, _: usize, name: &str, _: &Value) {
         let _ = emit(json!({"type":"tool", "name":name}));
     }
-    fn tool_finished(&self, _: usize, _: &str, _: &str, _: bool, _: Duration) {}
-    fn diagnostic(&self, _: &str) {}
+    fn tool_finished(&self, index: usize, name: &str, _: &str, error: bool, elapsed: Duration) {
+        let _ = emit(json!({"type":"tool_finished", "index":index, "name":name,
+            "error":error, "elapsed_ms":elapsed.as_millis()}));
+    }
+    fn diagnostic(&self, message: &str) {
+        eprintln!("{message}");
+    }
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -75,7 +78,7 @@ pub(crate) fn run() -> Result<()> {
     let workspace = Workspace {
         root: std::env::current_dir()?.canonicalize()?,
         yes: auto_approve,
-        frontend: Box::new(DiscordFrontend),
+        frontend: Box::new(ProtocolFrontend),
     };
     let root = session::directory()?;
     let (mut session, provider) = if let Some(id) = input["session"].as_str() {
@@ -84,66 +87,35 @@ pub(crate) fn run() -> Result<()> {
         let provider: Provider = serde_json::from_value(json!(
             std::env::var("AGENT_PROVIDER").unwrap_or("codex".into())
         ))?;
-        let mut request = Request {
-            model: std::env::var("AGENT_MODEL").unwrap_or(crate::models::DEFAULT_MODEL.into()),
-            messages: Vec::new(),
-            system: format!(
-                "{}\nWorkspace: {}",
-                include_str!("prompt.txt"),
-                workspace.root.display()
-            ),
-            tools: tools(),
-            json_schema: None,
-            max_tokens: 8192,
-            options: if provider == Provider::Codex {
-                serde_json::from_value(json!({"reasoning":{"summary":"auto"}}))?
-            } else {
-                Default::default()
-            },
-        };
-        request
-            .system
-            .push_str(&skills::catalog(&skills::discover(&workspace)));
-        if workspace.root.join("AGENTS.md").exists() {
-            request.system.push_str(&format!(
-                "\nRoot AGENTS.md:\n{}",
-                workspace.read(&workspace.path("AGENTS.md")?)?
-            ));
-        }
-        let store = Store::create(&root, &workspace.root, provider, &request)?;
         (
-            Session {
-                request,
-                store: Some(store),
-            },
+            runner::create(
+                &workspace,
+                provider,
+                std::env::var("AGENT_MODEL").unwrap_or(crate::models::DEFAULT_MODEL.into()),
+            )?,
             provider,
         )
     };
-    let client = if provider == Provider::Codex {
-        auth::codex_client()?
-    } else {
-        let key = match provider {
-            Provider::Anthropic => "ANTHROPIC_API_KEY",
-            Provider::Openrouter => "OPENROUTER_API_KEY",
-            _ => "OPENAI_API_KEY",
-        };
-        Client::new(provider, std::env::var(key)?)
-    };
+    let client = runner::connect(provider)?;
     emit(json!({"type":"session", "id":session.store.as_ref().unwrap().id}))?;
-    if !session.request.system.contains(COMPACT_INSTRUCTIONS) {
-        session.request.system.push_str(COMPACT_INSTRUCTIONS);
-    }
+    // Presentation belongs to the adapter, not persisted core instructions.
+    let presentation = input
+        .get("presentation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     session.request.messages.push(text("user", prompt.into()));
     session.save(true)?;
     let store = session.store.as_ref().unwrap();
-    let result = turn_compacting(
+    let result = runner::turn(
         &mut session.request,
         &workspace,
         max_turns,
         4 * 1024 * 1024,
         compaction::automatic(&client, Some(store), compaction::threshold()?, |_| {}),
         |request| {
-            let response = client.run_cancellable(request, &INTERRUPTED, |_| true)?;
+            let mut presented = request.clone();
+            presented.system.push_str(presentation);
+            let response = client.run_cancellable(&presented, &INTERRUPTED, |_| true)?;
             for block in &response.message.content {
                 if response.finish_reason == "stop" && block["type"] == "text" {
                     emit(json!({"type":"answer", "text":block["text"]}))?;
@@ -196,7 +168,7 @@ mod tests {
         let workspace = Workspace {
             root: std::env::current_dir().unwrap(),
             yes,
-            frontend: Box::new(DiscordFrontend),
+            frontend: Box::new(ProtocolFrontend),
         };
         let mut request = crate::tests::request();
         let mut calls = 0;

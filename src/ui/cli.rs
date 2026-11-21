@@ -1,12 +1,15 @@
 //! CLI configuration and terminal conversation controller.
 use super::{StreamDisplay, TerminalFrontend, input, live, styles_enabled};
 use crate::{
-    INTERRUPTED, Workspace, auth, check_interrupt, compaction,
-    engine::{text, tools, turn_compacting},
+    INTERRUPTED, Workspace, check_interrupt, compaction,
+    engine::text,
+    runner::{connect, turn as turn_compacting},
     session::{self, Session, Store},
     skills,
 };
-use llm_api::{Cancelled, Client, Provider, Request, Result};
+#[cfg(test)]
+use llm_api::Request;
+use llm_api::{Cancelled, Client, Provider, Result};
 use serde_json::json;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::Ordering;
@@ -96,61 +99,18 @@ pub(crate) fn run() -> Result<()> {
             verbose,
         );
     }
-    let mut request = Request {
-        model,
-        messages: Vec::new(),
-        system: format!(
-            "{}\nWorkspace: {}",
-            include_str!("../prompt.txt"),
-            workspace.root.display()
-        ),
-        tools: tools(),
-        json_schema: None,
-        max_tokens: 8192,
-        options: if provider == Provider::Codex {
-            // Codex otherwise may return only opaque replay, with no visible summary.
-            serde_json::from_value(json!({"reasoning":{"summary":"auto"}}))?
-        } else {
-            Default::default()
-        },
-    };
-    request
-        .system
-        .push_str(&skills::catalog(&skills::discover(&workspace)));
-    let instructions = workspace.root.join("AGENTS.md");
-    if instructions.exists() {
-        request.system.push_str(&format!(
-            "\nRoot AGENTS.md:\n{}",
-            workspace.read(&workspace.path("AGENTS.md")?)?
-        ));
-    }
     let client = connect(provider)?;
-    let store = Store::create(&root, &workspace.root, provider, &request)?;
+    let session = crate::runner::create(&workspace, provider, model)?;
     chat_session(
         client,
         workspace,
-        Session {
-            request,
-            store: Some(store),
-        },
+        session,
         provider,
         prompt,
         max_turns,
         max_context_bytes,
         verbose,
     )
-}
-
-fn connect(provider: Provider) -> Result<Client> {
-    if provider == Provider::Codex {
-        return auth::codex_client();
-    }
-    let key = match provider {
-        Provider::Anthropic => "ANTHROPIC_API_KEY",
-        Provider::Openrouter => "OPENROUTER_API_KEY",
-        _ => "OPENAI_API_KEY",
-    };
-    Ok(Client::new(provider, std::env::var(key)?))
 }
 
 #[cfg(test)]

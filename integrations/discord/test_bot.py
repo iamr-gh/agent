@@ -84,7 +84,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(other.db.execute("SELECT auto_approve, max_turns FROM sessions WHERE thread=?", (self.thread.id,)).fetchone(), (1, 7))
         other.db.close()
         await other.close()
-        self.client.active_thread = self.thread.id
+        self.client.runs.active[self.thread.id] = {"task": asyncio.current_task(), "workspace": bot.WORKSPACE, "state": "running"}
         await self.client.settings(self.interaction(), False, 3)
         self.assertEqual(self.client.db.execute("SELECT auto_approve, max_turns FROM sessions WHERE thread=?", (self.thread.id,)).fetchone(), (1, 7))
 
@@ -133,11 +133,40 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_cancels_active_task(self):
         task = asyncio.create_task(asyncio.sleep(100))
-        self.client.active = task
+        self.client.runs.active[self.thread.id] = {"task": task, "workspace": bot.WORKSPACE, "state": "running"}
         await self.client.on_disconnect()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.client.active = None
+        self.client.runs.active.clear()
+
+    async def test_stop_is_scoped_to_current_thread_and_status_is_owner_only(self):
+        task = asyncio.create_task(asyncio.sleep(100))
+        self.client.runs.active[999] = {"task": task, "workspace": bot.WORKSPACE, "state": "running"}
+        interaction = self.interaction()
+        await self.client.stop_turn(interaction)
+        self.assertFalse(task.cancelled())
+        self.assertIn("No active", interaction.response.send_message.call_args.args[0])
+        interaction = self.interaction(42)
+        await self.client.status(interaction)
+        self.assertEqual(interaction.response.send_message.call_args.args[0], "Not authorized.")
+        interaction = self.interaction()
+        await self.client.status(interaction)
+        self.assertIn("idle", interaction.response.send_message.call_args.args[0])
+        self.client.runs.cancel_all()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.client.runs.active.clear()
+
+    async def test_saved_workspace_and_generic_entry_point_reach_worker(self):
+        self.client.db.execute("UPDATE sessions SET workspace=?", (self.temp.name,))
+        stream = asyncio.StreamReader()
+        stream.feed_eof()
+        process = SimpleNamespace(stdout=stream, returncode=0, wait=AsyncMock(return_value=0),
+                                  stdin=SimpleNamespace(write=lambda _: None, drain=AsyncMock()))
+        with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=process)) as spawn:
+            await self.client.execute(self.thread, "task")
+        self.assertEqual(spawn.call_args.args[1], "--worker")
+        self.assertEqual(spawn.call_args.kwargs["cwd"], self.temp.name)
 
     async def test_worker_protocol_and_session_recovery(self):
         stream = asyncio.StreamReader()
@@ -165,7 +194,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                                   stdin=SimpleNamespace(write=writes.append, drain=AsyncMock()))
         with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=process)):
             await self.client.execute(self.thread, "task")
-        self.assertEqual(json.loads(writes[0]), {"prompt": "task", "session": None, "auto_approve": True, "max_turns": 2})
+        payload = json.loads(writes[0])
+        self.assertIn("Discord presentation", payload.pop("presentation"))
+        self.assertEqual(payload, {"prompt": "task", "session": None, "auto_approve": True, "max_turns": 2})
         self.assertIn("2-model-call cap", self.thread.send.call_args.args[0])
 
     async def test_corrupt_saved_policy_never_launches_worker(self):

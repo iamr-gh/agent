@@ -1,12 +1,14 @@
 mod auth;
 mod compaction;
-mod discord;
 mod engine;
 mod models;
+mod runner;
 mod session;
 mod skills;
 mod tool_history;
 mod ui;
+#[path = "discord.rs"]
+mod worker;
 
 use engine::{INTERRUPTED, Workspace, check_interrupt};
 use llm_api::Result;
@@ -23,8 +25,11 @@ fn install_interrupt_handler() {
 }
 fn main() {
     install_interrupt_handler();
-    let result = if std::env::args().nth(1).as_deref() == Some("--discord-worker") {
-        discord::run()
+    let result = if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--worker" | "--discord-worker")
+    ) {
+        worker::run()
     } else {
         ui::run()
     };
