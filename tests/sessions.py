@@ -118,7 +118,8 @@ with tempfile.TemporaryDirectory(prefix="agent-sessions-") as temporary:
         locked = subprocess.run([str(binary), "--resume", path.stem], cwd=workspace,
                                 env=env, capture_output=True, timeout=5)
         assert locked.returncode == 1 and b"already open" in locked.stderr
-        terminal.command("/clear")
+        cleared = terminal.command("/clear")
+        assert b"\x1b[H\x1b[2J\x1b[3J" in cleared
         assert len(list(sessions.glob("*.json"))) == 2
         # Search without IDs; no match, Enter, Escape, and Ctrl-C are safe.
         terminal.send("/resume")

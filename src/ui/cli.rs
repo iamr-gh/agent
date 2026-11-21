@@ -11,7 +11,7 @@ use crate::{
 use llm_api::Request;
 use llm_api::{Cancelled, Client, Provider, Result};
 use serde_json::json;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::Ordering;
 
 pub(crate) fn run() -> Result<()> {
@@ -215,6 +215,11 @@ fn chat_session(
                             provider,
                             &session.request,
                         )?);
+                    }
+                    let mut terminal = io::stderr().lock();
+                    if terminal.is_terminal() {
+                        // Home the cursor, erase the screen, and erase scrollback.
+                        terminal.write_all(b"\x1b[H\x1b[2J\x1b[3J")?;
                     }
                     continue;
                 }
