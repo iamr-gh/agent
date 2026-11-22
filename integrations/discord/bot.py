@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import sys
 
 from runner import Busy, Runs, worker
 
@@ -18,6 +19,7 @@ WORKSPACE = Path(__file__).resolve().parents[2]
 BINARY = WORKSPACE / "target/release/ag"
 CONFIG = Path.home() / ".config/agent/discord.env"
 STATE = Path.home() / ".agent/discord"
+RELOAD_NOTICE = "The bot is reloading after queued work finishes. This prompt was not queued; resend once it reconnects."
 
 
 def read_token(path=CONFIG):
@@ -101,6 +103,9 @@ class AgentBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.runs = Runs()
         self.drains = {}
+        self.opening = set()
+        self.reloading = False
+        self.restart_requested = False
         STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(STATE / "state.sqlite3")
         self.db.execute("CREATE TABLE IF NOT EXISTS sessions (thread INTEGER PRIMARY KEY, session TEXT)")
@@ -118,12 +123,40 @@ class AgentBot(discord.Client):
         self.tree.command(name="agent_stop", description="Cancel this thread's active turn and clear queued replies")(self.stop_turn)
         self.tree.command(name="agent_settings", description="Set approval mode and per-prompt model-call cap for this thread")(self.settings)
         self.tree.command(name="agent_status", description="Show this session's run status and workspace")(self.status)
+        self.tree.command(name="agent_reload", description="Restart the bot after active and queued turns finish")(self.reload_after_drain)
 
     async def setup_hook(self):
         await self.tree.sync()
 
     async def on_ready(self):
-        print("Discord bot connected; /agent, /agent_stop, /agent_status, /agent_settings registered.", flush=True)
+        print("Discord bot connected; /agent, /agent_stop, /agent_status, /agent_settings, /agent_reload registered.", flush=True)
+
+    async def reload_after_drain(self, interaction: discord.Interaction):
+        if interaction.user.id != OWNER_ID or interaction.guild is None:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        if self.reloading:
+            await interaction.response.send_message("Reload already scheduled; waiting for queued work to finish.", ephemeral=True)
+            return
+        self.reloading = True
+        try:
+            await interaction.response.send_message(
+                "Reload scheduled. Active and queued turns will finish first. New prompts must be resent after reconnecting.",
+                ephemeral=True,
+            )
+            # Admission is closed. An in-progress opener runs its drain in the same task.
+            tasks = self.opening | {task for task, _ in self.drains.values()} | {
+                run["task"] for run in self.runs.active.values()
+            }
+            if tasks:
+                # Cancelling this wait must not cancel the turns.
+                await asyncio.wait(tasks)
+            # Closing the gateway lets Client.run return; set the intent first.
+            self.restart_requested = True
+            await self.close()
+        finally:
+            if not self.restart_requested:
+                self.reloading = False
 
     def seen(self, event_id):
         inserted = self.db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (event_id,)).rowcount
@@ -137,6 +170,9 @@ class AgentBot(discord.Client):
                             workspace: str = ""):
         if interaction.user.id != OWNER_ID or interaction.guild is None:
             await interaction.response.send_message("Not authorized; use your server.", ephemeral=True)
+            return
+        if self.reloading:
+            await interaction.response.send_message(RELOAD_NOTICE, ephemeral=True)
             return
         if self.seen(interaction.id):
             await interaction.response.send_message("Already received.", ephemeral=True)
@@ -152,6 +188,14 @@ class AgentBot(discord.Client):
         except (OSError, ValueError) as error:
             await interaction.response.send_message(str(error), ephemeral=True)
             return
+        task = asyncio.current_task()
+        self.opening.add(task)
+        try:
+            await self.open_session(interaction, prompt, auto_approve, max_turns, root)
+        finally:
+            self.opening.remove(task)
+
+    async def open_session(self, interaction, prompt, auto_approve, max_turns, root):
         mode = ("Tools are approved automatically with full local privileges" if auto_approve
                 else "I'll ask before running shell commands or changing files")
         preview = discord.utils.escape_markdown(prompt_preview(prompt, 240), ignore_links=False)
@@ -194,6 +238,9 @@ class AgentBot(discord.Client):
         if not isinstance(message.channel, discord.Thread) or not message.content.strip():
             return
         if not self.db.execute("SELECT 1 FROM sessions WHERE thread=?", (message.channel.id,)).fetchone():
+            return
+        if self.reloading:
+            await message.channel.send(RELOAD_NOTICE)
             return
         if self.seen(message.id):
             return
@@ -390,12 +437,22 @@ class AgentBot(discord.Client):
                 view.stop()
 
 
-if __name__ == "__main__":
+def main():
     os.umask(0o077)
     token = read_token()
+    client = AgentBot()
     try:
-        AgentBot().run(token, log_handler=None)
+        client.run(token, log_handler=None)
     except discord.PrivilegedIntentsRequired:
         raise SystemExit("Enable Message Content Intent in Developer Portal > Bot > Privileged Gateway Intents for this token's application, save, then restart.") from None
     except discord.LoginFailure:
         raise SystemExit("Discord rejected the bot token. Update the private discord.env file, then restart.") from None
+    finally:
+        client.db.close()
+    if client.restart_requested:
+        print("Discord queue drained; restarting with updated code.", flush=True)
+        os.execv(sys.executable, sys.orig_argv)
+
+
+if __name__ == "__main__":
+    main()

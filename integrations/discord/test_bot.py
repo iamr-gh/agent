@@ -36,6 +36,22 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn("DISCORD_BOT_TOKEN", bot.worker_env())
 
 
+class LaunchTests(unittest.TestCase):
+    def test_main_reexecs_with_original_invocation_only_on_reload(self):
+        for restart in (False, True):
+            with self.subTest(restart=restart), patch.object(bot, "AgentBot") as make_client, \
+                    patch.object(bot, "read_token", return_value="synthetic"), patch.object(bot.os, "umask"), \
+                    patch.object(bot.os, "execv") as execv, patch("builtins.print"):
+                client = make_client.return_value
+                client.restart_requested = restart
+                bot.main()
+                self.assertEqual(client.mock_calls, [call.run("synthetic", log_handler=None), call.db.close()])
+                if restart:
+                    execv.assert_called_once_with(bot.sys.executable, bot.sys.orig_argv)
+                else:
+                    execv.assert_not_called()
+
+
 class AnswerChunkTests(unittest.TestCase):
     def test_short_and_exact_limit_answers_stay_in_one_message(self):
         for text in ("a " * 901, "x" * 2000, "😀" * 1000):
@@ -168,6 +184,92 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await self.client.start("synthetic-token", reconnect=True)
         login.assert_awaited_once_with("synthetic-token")
         connect.assert_awaited_once_with(reconnect=True)
+
+    async def test_reload_drains_checkout_and_thread_queues_before_closing(self):
+        busy = SimpleNamespace(id=4567, send=AsyncMock())
+        self.client.db.execute("INSERT INTO sessions (thread) VALUES (?)", (busy.id,))
+        started, release, waiting, scheduled = [asyncio.Event() for _ in range(4)]
+        self.thread.send.side_effect = lambda *_: waiting.set()
+        turns = []
+
+        async def run_turn(thread, prompt, message):
+            turns.append(prompt)
+            if thread is busy:
+                started.set()
+                await release.wait()
+            return True
+
+        interaction = self.interaction()
+        interaction.response.send_message.side_effect = lambda *args, **kwargs: scheduled.set()
+        with patch.object(bot.discord, "Thread", SimpleNamespace), \
+                patch.object(self.client, "run_turn", side_effect=run_turn), \
+                patch.object(self.client, "close", AsyncMock()) as close:
+            holder = asyncio.create_task(self.client.enqueue(busy, "active", None))
+            await asyncio.wait_for(started.wait(), 2)
+            waiter = asyncio.create_task(self.client.on_message(self.message(1, "checkout queue")))
+            await asyncio.wait_for(waiting.wait(), 2)
+            await self.client.on_message(self.message(2, "thread queue"))
+            reload = asyncio.create_task(self.client.reload_after_drain(interaction))
+            await asyncio.wait_for(scheduled.wait(), 2)
+            try:
+                await self.client.on_message(self.message(3, "too late"))
+                self.thread.send.assert_awaited_with(bot.RELOAD_NOTICE)
+                self.assertIsNone(self.client.db.execute("SELECT 1 FROM seen WHERE id=3").fetchone())
+                opener = self.interaction()
+                await self.client.start_session(opener, "too late")
+                opener.response.send_message.assert_awaited_once_with(bot.RELOAD_NOTICE, ephemeral=True)
+                duplicate = self.interaction()
+                await self.client.reload_after_drain(duplicate)
+                self.assertIn("already scheduled", duplicate.response.send_message.await_args.args[0])
+                self.assertEqual(turns, ["active"])
+                close.assert_not_awaited()
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(holder, waiter, reload), 2)
+            self.assertEqual(turns, ["active", "checkout queue", "thread queue"])
+            self.assertTrue(self.client.restart_requested)
+            close.assert_awaited_once()
+
+    async def test_reload_waits_for_slash_command_opening_a_thread(self):
+        opening, release, scheduled = [asyncio.Event() for _ in range(3)]
+        opener = self.interaction()
+        opener.id = 5678
+        opener.channel = SimpleNamespace()
+        parent = SimpleNamespace()
+        new_thread = SimpleNamespace(id=4321)
+
+        async def create_thread(**kwargs):
+            opening.set()
+            await release.wait()
+            return new_thread
+
+        parent.create_thread = create_thread
+        opener.original_response = AsyncMock(return_value=parent)
+        interaction = self.interaction()
+        interaction.response.send_message.side_effect = lambda *args, **kwargs: scheduled.set()
+        with patch.object(bot.discord, "TextChannel", SimpleNamespace), \
+                patch.object(self.client, "run_turn", AsyncMock(return_value=True)) as run, \
+                patch.object(self.client, "close", AsyncMock()) as close:
+            start = asyncio.create_task(self.client.start_session(opener, "accepted"))
+            await asyncio.wait_for(opening.wait(), 2)
+            reload = asyncio.create_task(self.client.reload_after_drain(interaction))
+            try:
+                await asyncio.wait_for(scheduled.wait(), 2)
+                close.assert_not_awaited()
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(start, reload), 2)
+            run.assert_awaited_once_with(new_thread, "accepted", parent)
+            close.assert_awaited_once()
+
+    async def test_reload_requires_owner_in_server(self):
+        for interaction in (self.interaction(42), self.interaction()):
+            if interaction.user.id == bot.OWNER_ID:
+                interaction.guild = None
+            await self.client.reload_after_drain(interaction)
+            interaction.response.send_message.assert_awaited_once_with("Not authorized.", ephemeral=True)
+        self.assertFalse(self.client.reloading)
+        self.assertFalse(self.client.restart_requested)
 
     async def test_disconnect_cancels_active_task(self):
         task = asyncio.create_task(asyncio.sleep(100))

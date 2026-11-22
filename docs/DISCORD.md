@@ -38,6 +38,14 @@ Keep the process running; it does not install an automatic startup service. Glob
 
 Thread-to-session mappings and received Discord event IDs persist in `~/.agent/discord/state.sqlite3`; model context uses the existing private saved sessions under `$AGENT_HOME/sessions`. Restart the bot and reply in the same thread to resume. A crashed or cancelled turn is never automatically retried, and saved tools are never replayed. Events received while offline are not backfilled. Deduplication prevents duplicate received prompts but is not an exactly-once guarantee across crashes.
 
+## Deploying Discord bot changes
+
+After updating the bot files, run `/agent_reload` in the server as the owner. The bot stops accepting new prompts, finishes active turns and already-queued replies, then replaces its process using the same Python interpreter and launch arguments. It reconnects with the updated code; keep using the same threads. Resend any prompts you sent during the drain or while the bot was offline.
+
+Approvals, `/agent_status`, and `/agent_stop` still work during the drain. There is no deadline: a long-running turn or a Codex quota pause can delay the reload. If you don't want to wait for a particular thread, use `/agent_stop` there. This is a graceful restart, not a live code swap; unexpected disconnects still cancel work, and if the updated code fails to start, fix it and start the bot manually.
+
+If the currently running bot predates `/agent_reload`, wait until it is idle and restart it once to register the command. For changes only to the Rust worker, rebuild `target/release/ag`; each new turn launches that binary, so the bot itself does not need to restart.
+
 ## Boundaries and limitations
 
 `ag --worker` (legacy alias: `--discord-worker`) is a frontend-neutral JSON-lines subprocess entry point: the adapter supplies a prompt/session, optional presentation instructions, and the owner-selected `auto_approve`/`max_turns` policy on stdin, receives session/answer/approval/tool/tool_finished/limit/done events on stdout, and returns an explicit boolean for each manual approval. Presentation instructions are applied to inference copies, not persisted into new core sessions. `src/runner.rs` shares authentication, session construction, and leased turn execution with the terminal; `integrations/discord/runner.py` owns submit/status/cancel/event routing and subprocess cleanup without depending on Discord. Missing policy fields default to manual mode and 25 calls; malformed fields or limits outside 1–100 fail before tools run. Permissions are never inferred from model output or loaded from saved model context. Each turn has an isolated process and reuses the same engine, tools, credential discovery, and session checkpoints, with a 4 MiB serialized context limit. Only the final complete answer is sent to Discord, not intermediate tool-step commentary or reasoning. The terminal CLI is unchanged.
