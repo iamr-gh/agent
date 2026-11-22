@@ -173,6 +173,27 @@ class QuotaWorkerTests(unittest.IsolatedAsyncioTestCase):
         with locked(self.root / "sessions" / f"{sid}.lock"), locked(self.checkout):
             pass
 
+    def quota_notices(self):
+        return [msg.split("**")[1] for msg in self.messages() if msg.startswith("**Codex usage")]
+
+    async def test_repeated_quota_rejection_only_confirms_after_success(self):
+        self.replies = [quota(1), quota(1), answer("recovered answer")]
+        await asyncio.wait_for(self.client.submit(self.thread, "retry twice"), 5)
+        stopped = "Codex usage exhausted — waiting."
+        self.assertEqual(self.quota_notices(), [stopped, stopped, "Codex usage restored."])
+        self.assertTrue(any("provider reset" in msg for msg in self.messages()))
+        self.assertEqual(self.messages()[-1], "recovered answer")
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.calls[0], self.calls[1])
+        self.assertEqual(self.calls[1], self.calls[2])
+
+    async def test_unrelated_retry_failure_does_not_confirm_recovery(self):
+        self.replies = [quota(1), (500, "synthetic provider error")]
+        await asyncio.wait_for(self.client.submit(self.thread, "retry failure"), 5)
+        self.assertEqual(self.quota_notices(), ["Codex usage exhausted — waiting."])
+        self.assertIn("Turn stopped with an error", self.messages()[-1])
+        self.assertEqual(len(self.calls), 2)
+
     async def test_automatic_compaction_resumes_same_summary_then_infers(self):
         self.replies = [answer("seed")]
         await asyncio.wait_for(self.client.submit(self.thread, "seed"), 5)

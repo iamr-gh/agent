@@ -219,6 +219,7 @@ impl Typing {
             error: None,
             accepting: true,
             working,
+            quota_footer: None,
             escape: Vec::new(),
             escape_at: Instant::now(),
             escaped: false,
@@ -323,6 +324,7 @@ struct Screen {
     error: Option<io::Error>,
     accepting: bool,
     working: bool,
+    quota_footer: Option<&'static str>,
     escape: Vec<u8>,
     escape_at: Instant,
     escaped: bool,
@@ -453,7 +455,9 @@ impl Screen {
         }
         let top = self.height() + 1;
         let width = self.size.0.saturating_sub(1).max(1);
-        let label = if self.typing.selected.is_some() {
+        let label = if self.quota_footer.is_some() {
+            self.quota_footer
+        } else if self.typing.selected.is_some() {
             Some("Tab: steer | e: edit | Del: remove")
         } else if !self.working {
             Some("Paused | ↑: select pending | Enter/Tab: send")
@@ -605,6 +609,15 @@ pub(super) fn steering_delivered(count: usize) {
             }
         }
     });
+}
+
+pub(super) fn quota_notice(text: &str, footer: Option<&'static str>) -> io::Result<()> {
+    ACTIVE.with(|active| {
+        if let Some(screen) = active.borrow().as_ref() {
+            screen.lock().unwrap().quota_footer = footer;
+        }
+    });
+    output(text, true)
 }
 
 pub(super) fn output(text: &str, stderr: bool) -> io::Result<()> {

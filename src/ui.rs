@@ -73,8 +73,25 @@ impl Frontend for TerminalFrontend {
         let _ = live::output(&format!("skills: {}\n", display(message)), true);
     }
 
-    fn quota_status(&self, _state: &str, message: &str) -> Result<()> {
-        live::output(&format!("{}\n", display(message)), true)?;
+    fn quota_status(&self, state: &str, message: &str) -> Result<()> {
+        let (label, footer) = match state {
+            "quota_paused" => (
+                "CODEX USAGE EXHAUSTED — WAITING",
+                Some("CODEX USAGE EXHAUSTED · Waiting · Esc: interrupt"),
+            ),
+            "quota_retrying" => (
+                "CHECKING CODEX USAGE",
+                Some("CODEX USAGE · Checking recovery · Esc: interrupt"),
+            ),
+            "quota_resumed" => ("CODEX USAGE RESTORED", None),
+            _ => ("CODEX LOGIN REQUIRED", None),
+        };
+        let notice = styled(
+            label,
+            Style::Status,
+            styles_enabled(io::stderr().is_terminal()),
+        );
+        live::quota_notice(&format!("\n[{notice}] {}\n\n", display(message)), footer)?;
         Ok(())
     }
 
@@ -95,6 +112,7 @@ pub fn styles_enabled(terminal: bool) -> bool {
 pub enum Style {
     Input,
     Tool,
+    Status,
 }
 
 /// Wrap already-escaped text, resetting every fragment to avoid style leakage.
@@ -105,6 +123,7 @@ pub fn styled(text: &str, style: Style, enabled: bool) -> String {
     let code = match style {
         Style::Input => "0;36",
         Style::Tool => "0;33",
+        Style::Status => "1;33",
     };
     format!("\x1b[{code}m{text}\x1b[0m")
 }

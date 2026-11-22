@@ -2,6 +2,7 @@
 //! Each process runs one turn; process boundaries isolate cancellation/approvals.
 use crate::{
     auth,
+    compaction::Automatic,
     engine::{self, Workspace, tools},
     session::{self, Session, Store},
     skills,
@@ -126,6 +127,7 @@ struct ActiveTurn<'a> {
     model: TurnModel<'a>,
     workspace: &'a Workspace,
     lease: Option<WorkspaceLease>,
+    recovery_pending: bool,
 }
 
 fn wait_until(
@@ -154,8 +156,14 @@ impl ActiveTurn<'_> {
             store.save(request, false)?;
         }
         self.lease.take();
+        self.recovery_pending = true;
         let timing = if reported.is_some() {
-            format!("provider reset in {} seconds", delay.as_secs())
+            format!(
+                "provider reset in {}h {:02}m {:02}s",
+                delay.as_secs() / 3600,
+                delay.as_secs() / 60 % 60,
+                delay.as_secs() % 60,
+            )
         } else {
             "retrying in 5 hours (fallback; provider did not report a reset)".into()
         };
@@ -191,12 +199,25 @@ impl ActiveTurn<'_> {
                 return Err(message.into());
             }
         };
-        self.workspace.frontend.quota_status(
-            "quota_resumed",
-            "Codex quota wait ended. Retrying the pending model call.",
-        )?;
         if let Some(store) = self.model.store {
             store.save(request, true)?;
+        }
+        engine::check_interrupt()?;
+        self.workspace.frontend.quota_status(
+            "quota_retrying",
+            "Retrying the pending model call to check whether Codex usage is back.",
+        )
+    }
+
+    fn confirm_recovery(&mut self) -> Result<()> {
+        if self.recovery_pending {
+            engine::check_interrupt()?;
+            self.workspace.frontend.quota_check()?;
+            self.workspace.frontend.quota_status(
+                "quota_resumed",
+                "A model call succeeded; continuing the turn.",
+            )?;
+            self.recovery_pending = false;
         }
         Ok(())
     }
@@ -209,7 +230,7 @@ pub(crate) fn turn(
     max_turns: usize,
     max_context_bytes: usize,
     model: TurnModel<'_>,
-    mut compact: impl FnMut(&Client, &mut Request) -> Result<bool>,
+    mut compact: impl FnMut(&Client, &mut Request) -> Result<Automatic>,
     mut infer: impl FnMut(&Client, &Request) -> Result<Response>,
     checkpoint: impl FnMut(&Request) -> Result<()>,
 ) -> Result<()> {
@@ -217,6 +238,7 @@ pub(crate) fn turn(
         model,
         workspace,
         lease: Some(WorkspaceLease::acquire(&workspace.root)?),
+        recovery_pending: false,
     });
     engine::turn_compacting(
         request,
@@ -230,7 +252,13 @@ pub(crate) fn turn(
                 Err(error) if error.is::<CodexQuota>() => {
                     state.pause(request, error.downcast_ref::<CodexQuota>().unwrap())?;
                 }
-                result => return result,
+                Ok(Automatic::Compacted) => {
+                    state.confirm_recovery()?;
+                    return Ok(true);
+                }
+                Ok(Automatic::Failed) => return Ok(true),
+                Ok(Automatic::NotNeeded) => return Ok(false),
+                Err(error) => return Err(error),
             }
         },
         |settled, projected| loop {
@@ -240,7 +268,13 @@ pub(crate) fn turn(
                 Err(error) if error.is::<CodexQuota>() => {
                     state.pause(settled, error.downcast_ref::<CodexQuota>().unwrap())?;
                 }
-                result => return result,
+                Ok(response) => {
+                    if matches!(response.finish_reason.as_str(), "stop" | "tool_calls") {
+                        state.confirm_recovery()?;
+                    }
+                    return Ok(response);
+                }
+                Err(error) => return Err(error),
             }
         },
         checkpoint,
@@ -286,7 +320,7 @@ mod tests {
                 1,
                 1024 * 1024,
                 TurnModel::new(&mut Client::new(Provider::Openai, "dummy"), None),
-                |_, _| Ok(false),
+                |_, _| Ok(Automatic::NotNeeded),
                 |_, _| Err("synthetic provider failure".into()),
                 |_| Ok(())
             )
@@ -298,7 +332,7 @@ mod tests {
             1,
             1024 * 1024,
             TurnModel::new(&mut Client::new(Provider::Openai, "dummy"), None),
-            |_, _| Ok(false),
+            |_, _| Ok(Automatic::NotNeeded),
             |_, _| Ok(response(vec![], "stop")),
             |_| Ok(()),
         )

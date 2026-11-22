@@ -59,6 +59,12 @@ Supported provider modes are OpenAI, Anthropic, OpenRouter, and Codex. API-key m
 
 Profiles must be private, user-owned regular files, not symlinks, and no larger than 1 MiB. The version-1 profile contains `access_token`, `account_id`, and `expires_at_ms`; tokens expiring in less than a minute are rejected. The application does not perform OAuth login or token refresh, and never writes these profiles.
 
+## Codex subscription usage
+
+A structured `usage_limit_reached` pauses automatic compaction or inference and retries the pending call in place, without replaying completed tools. A bare HTTP 429 or a different provider error does not enter this wait. The CLI and active Discord thread show the provider's reset delay, or the five-hour fallback when none is available. The reset time only schedules a retry; the recovery notice requires a successful model call. The CLI keeps a waiting indicator in its live footer; Esc or Ctrl-C cancels the wait.
+
+To query available subscription usage, upstream Codex documents the [`account/rateLimits/read` App Server RPC](https://developers.openai.com/codex/app-server/), which reports usage percentages and reset times. The [upstream HTTP client](https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs) currently uses `GET /backend-api/wham/usage` on `chatgpt.com` (or `GET /api/codex/usage` for its alternate Codex API base). Those HTTP routes are implementation details, not documented standalone APIs. `ag` does not poll them; no live credentialed request was used to verify them.
+
 ## Terminal behavior
 
 On a styled terminal, `termimad` renders buffered Markdown for answers and reasoning. Each role's text is flushed when the role changes or the request ends, including error/cancellation cleanup. Reasoning uses a distinct color. This is buffered rendering, not incremental Markdown parsing on every network chunk. Nonterminal output or `NO_COLOR` uses escaped plain streaming text, with a `Thinking:` label for reasoning. Rendering does not alter the stored request or tool results.

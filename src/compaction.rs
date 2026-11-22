@@ -179,11 +179,17 @@ pub(crate) fn manual(
     Ok(())
 }
 
+pub(crate) enum Automatic {
+    NotNeeded,
+    Compacted,
+    Failed,
+}
+
 pub(crate) fn automatic<'a>(
     store: Option<&'a Store>,
     threshold: usize,
     notify: impl Fn(&str) + 'a,
-) -> impl FnMut(&Client, &mut Request) -> Result<bool> + 'a {
+) -> impl FnMut(&Client, &mut Request) -> Result<Automatic> + 'a {
     let mut failed = false;
     move |client, request| {
         if failed
@@ -191,22 +197,25 @@ pub(crate) fn automatic<'a>(
             || request.messages.len() < KEEP + 2
             || size(request) < threshold
         {
-            return Ok(false);
+            return Ok(Automatic::NotNeeded);
         }
         let Some(plan) = plan(request) else {
-            return Ok(false);
+            return Ok(Automatic::NotNeeded);
         };
         match summarize(client, request, plan) {
-            Ok(candidate) => notify(&commit(request, candidate, store, true)?),
+            Ok(candidate) => {
+                notify(&commit(request, candidate, store, true)?);
+                Ok(Automatic::Compacted)
+            }
             Err(error) if error.is::<Cancelled>() || error.is::<llm_api::CodexQuota>() => {
-                return Err(error);
+                Err(error)
             }
             Err(error) => {
                 failed = true;
                 notify(&format!("Automatic compaction skipped: {error}"));
+                Ok(Automatic::Failed) // Still counts against the model-call budget.
             }
         }
-        Ok(true) // Count the summarization attempt against the turn's model-call budget.
     }
 }
 

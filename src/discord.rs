@@ -180,13 +180,7 @@ fn run_with_connector(connect: fn(Provider) -> Result<llm_api::Client>) -> Resul
         |client, request| {
             let mut presented = request.clone();
             presented.system.push_str(presentation);
-            let response = client.run_cancellable(&presented, &INTERRUPTED, |_| true)?;
-            for block in &response.message.content {
-                if response.finish_reason == "stop" && block["type"] == "text" {
-                    emit(json!({"type":"answer", "text":block["text"]}))?;
-                }
-            }
-            Ok(response)
+            client.run_cancellable(&presented, &INTERRUPTED, |_| true)
         },
         |request| store.save(request, true),
     );
@@ -196,6 +190,14 @@ fn run_with_connector(connect: fn(Provider) -> Result<llm_api::Client>) -> Resul
             return Err(error);
         }
         emit(json!({"type":"limit", "max_turns":max_turns}))?;
+    } else if let Some(answer) = session.request.messages.last() {
+        // The engine has accepted and saved the final response. Any quota
+        // recovery notice has already been emitted by the runner.
+        for block in &answer.content {
+            if block["type"] == "text" {
+                emit(json!({"type":"answer", "text":block["text"]}))?;
+            }
+        }
     }
     emit(json!({"type":"done"}))
 }
