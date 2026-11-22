@@ -115,12 +115,21 @@ fn frontend_denial_settles_each_mutating_tool_without_side_effects() {
     let results = &req.messages[2].content;
     let events = recorder.events.borrow();
     assert_eq!(results.len(), cases.len());
-    assert_eq!(events.len(), cases.len() * 3);
-    for ((_, name, args), (result, events)) in
-        cases.iter().zip(results.iter().zip(events.chunks_exact(3)))
-    {
-        assert_eq!(events[1], json!({"approval":name,"args":args}));
-        assert_eq!(events[2]["is_error"], true);
-        assert_eq!(result["is_error"], true);
+    let approvals: Vec<_> = events
+        .iter()
+        .filter(|event| event.get("approval").is_some())
+        .cloned()
+        .collect();
+    assert_eq!(
+        approvals,
+        cases
+            .each_ref()
+            .map(|(_, name, args)| json!({"approval":name,"args":args}))
+    );
+    for ((id, _, _), result) in cases.iter().zip(results) {
+        assert_eq!(
+            *result,
+            json!({"type":"tool_result","id":id,"is_error":true,"output":"denied by test frontend"})
+        );
     }
 }

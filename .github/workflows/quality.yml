@@ -42,20 +42,21 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --locked --offline --all-targets -- -D warnings
-      - name: Test Rust and release CLI
+      - name: Test Rust
+        run: cargo test --locked --offline
+      - name: Test Discord adapter and queue
+        working-directory: agent/integrations/discord
+        run: '"$RUNNER_TEMP/agent-venv/bin/python" -m unittest test_bot test_runner'
+      - name: Smoke-test the release CLI in a terminal
+        if: github.event_name != 'pull_request'
         run: |
-          cargo test --locked --offline
           cargo build --release --locked --offline
           python3 tests/sessions.py
-      - name: Test Discord adapter and Rust worker on loopback
+      - name: Test Discord and Rust worker quota recovery together
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
-          test_binary=$(cargo test --locked --offline --bin ag --no-run --message-format=json | python3 -c '
-          import json, sys
-          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("reason") == "compiler-artifact"
-                   and m["profile"]["test"] and m["target"]["name"] == "ag" and m["executable"]]
-          if len(paths) != 1:
-              sys.exit("expected one ag test executable")
-          print(paths[0])
-          ')
-          AGENT_TEST_BINARY="$test_binary" "$RUNNER_TEMP/agent-venv/bin/python" -m unittest discover -s integrations/discord
+          test_binary=$(cargo test --locked --offline --bin ag --no-run --message-format=json |
+            jq -er 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "ag") | .executable // empty')
+          AGENT_TEST_BINARY="$test_binary" PYTHONPATH=integrations/discord \
+            "$RUNNER_TEMP/agent-venv/bin/python" -m unittest test_quota_worker

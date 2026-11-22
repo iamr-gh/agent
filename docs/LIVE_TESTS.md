@@ -32,13 +32,17 @@ These checks do not prove model instruction following, production-provider avail
 ## Pull request and weekly checks
 
 The **Code quality** GitHub Actions workflow runs on pull requests, weekly on
-Monday at 04:23 UTC against the default branch, and on manual request. It checks
-formatting and Clippy warnings across Rust targets, runs the Rust suite, builds
-the release CLI and exercises it in a PTY, and runs the Discord adapter and
-worker tests against a synthetic loopback provider. The approval regression
-checks that denied writes and edits leave files unchanged, that a denied shell
-command does not create its marker, and that all three return errors. No model
-is needed.
+Monday at 04:23 UTC against the default branch, and on manual request.
+
+- **Every run:** rustfmt, Clippy, the Rust test suite, and the Discord adapter
+  and queue tests. The approval regression checks that denied writes, edits,
+  and shell calls have no side effects and return a denial for each call ID.
+- **Weekly and manual runs:** also build the release CLI and exercise session
+  handling in a real PTY, and test quota recovery and cancellation across the
+  Discord adapter and Rust worker using a synthetic loopback provider. Use
+  manual dispatch on a branch when changing these paths.
+
+No model is needed.
 
 The job uses a disposable GitHub-hosted runner, a read-only repository token,
 no persisted checkout credentials, and no provider or production secrets.
