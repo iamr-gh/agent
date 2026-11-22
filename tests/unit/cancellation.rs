@@ -70,7 +70,7 @@ impl Process {
             .env("AGENT_CANCEL_BATCH", if interactive { "0" } else { "1" });
         let terminal = if interactive {
             let (mut master, mut slave): (RawFd, RawFd) = (-1, -1);
-            let mut size = libc::winsize {
+            let size = libc::winsize {
                 ws_row: 24,
                 ws_col: 40,
                 ws_xpixel: 0,
@@ -84,7 +84,7 @@ impl Process {
                         &mut slave,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
-                        &mut size,
+                        &size,
                     )
                 },
                 0

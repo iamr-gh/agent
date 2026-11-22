@@ -1,0 +1,61 @@
+name: Code quality
+
+on:
+  pull_request:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Offline application checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - name: Check out agent
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: agent
+          persist-credentials: false
+      - name: Check out the public llm-api sibling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: iamr-gh/llm-api
+          ref: 6ea1b814337db78da7d4a2e307f12fce1c198aa3
+          path: llm-api
+          persist-credentials: false
+      - name: Prepare build and test dependencies
+        run: |
+          rustup component add rustfmt clippy
+          cargo fetch --locked
+          python3 -m venv "$RUNNER_TEMP/agent-venv"
+          "$RUNNER_TEMP/agent-venv/bin/python" -m pip install -r integrations/discord/requirements.txt
+      - name: Check formatting and lint all Rust targets
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --offline --all-targets -- -D warnings
+      - name: Test Rust and release CLI
+        run: |
+          cargo test --locked --offline
+          cargo build --release --locked --offline
+          python3 tests/sessions.py
+      - name: Test Discord adapter and Rust worker on loopback
+        shell: bash
+        run: |
+          test_binary=$(cargo test --locked --offline --bin ag --no-run --message-format=json | python3 -c '
+          import json, sys
+          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("reason") == "compiler-artifact"
+                   and m["profile"]["test"] and m["target"]["name"] == "ag" and m["executable"]]
+          if len(paths) != 1:
+              sys.exit("expected one ag test executable")
+          print(paths[0])
+          ')
+          AGENT_TEST_BINARY="$test_binary" "$RUNNER_TEMP/agent-venv/bin/python" -m unittest discover -s integrations/discord

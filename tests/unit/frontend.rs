@@ -66,10 +66,7 @@ fn engine_delivers_raw_events_and_preserves_raw_transcript() {
     let events = recorder.events.borrow();
     assert_eq!(events.len(), 5);
     assert_eq!(events[0]["started"], "read_file");
-    assert_eq!(
-        events[1]["output"],
-        format!("1\t# Heading\n2\t**bold**\u{1b}[31m\n")
-    );
+    assert_eq!(events[1]["output"], "1\t# Heading\n2\t**bold**\u{1b}[31m\n");
     assert_eq!(req.messages[2].content[0]["output"], events[1]["output"]);
     assert_eq!(events[2]["started"], "write_file");
     assert_eq!(events[3]["approval"], "write_file");
@@ -79,18 +76,32 @@ fn engine_delivers_raw_events_and_preserves_raw_transcript() {
 }
 
 #[test]
-fn frontend_denial_settles_tool_without_writing() {
+fn frontend_denial_settles_each_mutating_tool_without_side_effects() {
     let mut fixture = Fixture::new();
     let recorder = Recorder::default();
     fixture.0.frontend = Box::new(recorder.clone());
     fixture.0.yes = false;
+    let existing = fixture.0.root.join("existing");
+    fs::write(&existing, "original").unwrap();
+    let cases = [
+        ("w", "write_file", json!({"path":"new","content":"no"})),
+        (
+            "e",
+            "edit_file",
+            json!({"path":"existing","old_string":"original","new_string":"no"}),
+        ),
+        ("s", "shell", json!({"command":"touch shell-marker"})),
+    ];
     let mut req = request();
     let mut round = 0;
     turn(&mut req, &fixture.0, 2, 4 * 1024 * 1024, |_| {
         round += 1;
         Ok(if round == 1 {
             response(
-                vec![call("w", "write_file", json!({"path":"a","content":"no"}))],
+                cases
+                    .iter()
+                    .map(|(id, name, args)| call(id, name, args.clone()))
+                    .collect(),
                 "tool_calls",
             )
         } else {
@@ -98,7 +109,18 @@ fn frontend_denial_settles_tool_without_writing() {
         })
     })
     .unwrap();
-    assert!(!fixture.0.root.join("a").exists());
-    assert_eq!(req.messages[2].content[0]["is_error"], true);
-    assert_eq!(recorder.events.borrow()[2]["is_error"], true);
+    assert!(!fixture.0.root.join("new").exists());
+    assert!(!fixture.0.root.join("shell-marker").exists());
+    assert_eq!(fs::read(&existing).unwrap(), b"original");
+    let results = &req.messages[2].content;
+    let events = recorder.events.borrow();
+    assert_eq!(results.len(), cases.len());
+    assert_eq!(events.len(), cases.len() * 3);
+    for ((_, name, args), (result, events)) in
+        cases.iter().zip(results.iter().zip(events.chunks_exact(3)))
+    {
+        assert_eq!(events[1], json!({"approval":name,"args":args}));
+        assert_eq!(events[2]["is_error"], true);
+        assert_eq!(result["is_error"], true);
+    }
 }

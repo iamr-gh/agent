@@ -29,6 +29,32 @@ The Rust tests cover:
 
 These checks do not prove model instruction following, production-provider availability, sandbox isolation, exactly-once effects, or recovery of arbitrary external processes. Record the actual commands, outcomes, and environment for a verification run rather than copying an old test count.
 
+## Pull request and weekly checks
+
+The **Code quality** GitHub Actions workflow runs on pull requests, weekly on
+Monday at 04:23 UTC against the default branch, and on manual request. It checks
+formatting and Clippy warnings across Rust targets, runs the Rust suite, builds
+the release CLI and exercises it in a PTY, and runs the Discord adapter and
+worker tests against a synthetic loopback provider. The approval regression
+checks that denied writes and edits leave files unchanged, that a denied shell
+command does not create its marker, and that all three return errors. No model
+is needed.
+
+The job uses a disposable GitHub-hosted runner, a read-only repository token,
+no persisted checkout credentials, and no provider or production secrets.
+Dependency setup uses the network; `--offline` restricts Cargo, not the test
+processes. Because PR builds run contributor code, do not move this job to
+`pull_request_target` or to a machine that holds sensitive data. CI pins the
+public `llm-api` sibling checkout; update the pin deliberately when changing
+the expected dependency revision.
+
+To block merges on failures, require **Offline application checks** in the
+branch rules and review PR changes to the workflow and test assertions as
+carefully as changes to the security boundaries. Passing CI is not a sandbox
+or a security guarantee: tools are auto-approved by default. When running the
+agent on untrusted inputs, use `--ask` and a separate low-privilege environment
+without sensitive files or credentials mounted into it.
+
 ## Existing live runner: limitations
 
 `tests/live.py` contains opt-in `read`, `deny`, `approve`, and `code` scenarios in disposable workspaces. It is **not currently a self-contained or up-to-date acceptance runner**:
