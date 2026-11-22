@@ -220,6 +220,43 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.thread.send.assert_not_awaited()
         self.assertFalse(self.client.drains)
 
+    async def test_checkout_queue_notice_status_and_stop(self):
+        holder = 4567
+        blocker, noticed = asyncio.Event(), asyncio.Event()
+        self.thread.send.side_effect = lambda *_: noticed.set()
+        workspace = self.temp.name
+        self.client.db.execute("UPDATE sessions SET workspace=? WHERE thread=?", (workspace, self.thread.id))
+        runs = self.client.runs
+        owner = asyncio.create_task(runs.submit(holder, workspace, blocker.wait))
+        with patch.object(self.client, "run_turn", new_callable=AsyncMock) as run:
+            waiter = asyncio.create_task(self.client.enqueue(self.thread, "queued prompt", None))
+            try:
+                await asyncio.wait_for(noticed.wait(), 2)
+                self.assertIn("Queued at #1; no need to resend", self.thread.send.await_args.args[0])
+                self.thread.send.assert_awaited_once()
+                runs.event(holder, {"type": "approval"})
+                await self.client.enqueue(self.thread, "later reply", None)
+                interaction = self.interaction()
+                await self.client.status(interaction)
+                status = interaction.response.send_message.await_args.args[0]
+                self.assertIn("1 queued replies in this thread", status)
+                self.assertIn("Checkout queue: #1 · held by <#4567> (awaiting approval)", status)
+                await self.client.stop_turn(interaction)
+                notice = interaction.response.send_message.await_args.args[0]
+                self.assertIn("checkout queue", notice)
+                self.assertIn("Cleared 1 queued", notice)
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(waiter, 2)
+                self.assertIsNone(runs.queue_position(self.thread.id))
+                self.assertFalse(owner.done())
+                self.assertFalse(self.client.drains)
+                run.assert_not_awaited()
+            finally:
+                blocker.set()
+                if not waiter.done():
+                    waiter.cancel()
+                await asyncio.gather(owner, waiter, return_exceptions=True)
+
     async def test_stop_and_disconnect_discard_queued_replies(self):
         for disconnect in (False, True):
             with self.subTest(disconnect=disconnect):

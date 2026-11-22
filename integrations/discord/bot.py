@@ -188,7 +188,7 @@ class AgentBot(discord.Client):
             else:
                 pending.append((prompt, message))
             return
-        # Keep the FIFO at Discord ingress; Runs still rejects session and checkout contention.
+        # Keep later replies in the thread FIFO until the head finishes its turn.
         pending = deque()
         self.drains[thread.id] = (asyncio.current_task(), pending)
         try:
@@ -202,10 +202,21 @@ class AgentBot(discord.Client):
     async def submit(self, thread, prompt, message=None):
         row = self.db.execute("SELECT workspace FROM sessions WHERE thread=?", (thread.id,)).fetchone()
         try:
-            return await self.runs.submit(thread.id, row[0] or WORKSPACE, lambda: self.run_turn(thread, prompt, message))
+            return await self.runs.submit(
+                thread.id, row[0] or WORKSPACE, lambda: self.run_turn(thread, prompt, message),
+                on_wait=lambda position: self.notify_checkout_wait(thread, position),
+            )
         except (Busy, OSError) as error:
             await thread.send(f"Not started: {error} Resend when ready.")
             return False
+
+    async def notify_checkout_wait(self, thread, position, *, after_quota=False):
+        reason = "Ready to retry after the Codex usage pause, but the checkout is occupied" if after_quota else "Waiting for this checkout"
+        with suppress(discord.HTTPException, OSError, asyncio.TimeoutError):
+            await asyncio.wait_for(thread.send(
+                f"**{reason}.** Queued at #{position}; no need to resend. "
+                "Use `/agent_status` for the current position or `/agent_stop` to cancel."
+            ), timeout=3)
 
     async def run_turn(self, thread, prompt, message):
         try:
@@ -228,19 +239,35 @@ class AgentBot(discord.Client):
         row = self.db.execute("SELECT workspace FROM sessions WHERE thread=?", (interaction.channel_id,)).fetchone()
         drain = self.drains.get(interaction.channel_id)
         queued = len(drain[1]) if drain else 0
-        text = (f"{self.runs.status(interaction.channel_id)} · {queued} queued · {row[0] or WORKSPACE}" if row
-                else "Use this command inside an agent thread.")
+        if row is None:
+            await interaction.response.send_message("Use this command inside an agent thread.", ephemeral=True)
+            return
+        key = interaction.channel_id
+        text = f"{self.runs.status(key)} · {queued} queued replies in this thread · {row[0] or WORKSPACE}"
+        position = self.runs.queue_position(key)
+        if position is not None:
+            text += f"\nCheckout queue: #{position}"
+            owner = self.runs.checkout_owner(self.runs.active[key]["workspace"])
+            if owner is not None:
+                text += f" · held by <#{owner}> ({self.runs.status(owner)})"
+            elif position > 1:
+                text += " · earlier turns are ahead"
+            else:
+                text += " · next to start"
+        elif self.runs.active.get(key, {}).get("owns_checkout"):
+            text += "\nThis thread holds the checkout."
         await interaction.response.send_message(text, ephemeral=True)
 
     async def stop_turn(self, interaction: discord.Interaction):
         if interaction.user.id != OWNER_ID or interaction.guild is None:
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
+        waiting_to_start = self.runs.status(interaction.channel_id) == "waiting for checkout"
         cancelled, cleared = self.cancel_thread(interaction.channel_id)
         if cancelled:
-            await interaction.response.send_message(
-                f"Cancelling this thread. Cleared {cleared} queued replies. Completed changes are not rolled back.",
-                ephemeral=True)
+            notice = ("Removed this thread's waiting turn from the checkout queue." if waiting_to_start
+                      else "Cancelling this thread. Completed changes are not rolled back.")
+            await interaction.response.send_message(f"{notice} Cleared {cleared} queued replies.", ephemeral=True)
         else:
             await interaction.response.send_message("No active turn.", ephemeral=True)
 
@@ -310,7 +337,9 @@ class AgentBot(discord.Client):
                     elif kind == "quota_login":
                         await thread.send(event["message"])
                     elif kind == "quota_ready":
-                        await self.runs.reserve_after_quota(thread.id)
+                        await self.runs.reserve_after_quota(
+                            thread.id, on_wait=lambda position: self.notify_checkout_wait(thread, position, after_quota=True)
+                        )
                         await handle.send({"resume": True})
                     elif kind == "limit":
                         limited = True
