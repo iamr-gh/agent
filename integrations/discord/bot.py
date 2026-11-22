@@ -125,7 +125,11 @@ class AgentBot(discord.Client):
         except (OSError, ValueError) as error:
             await interaction.response.send_message(str(error), ephemeral=True)
             return
-        await interaction.response.send_message("Starting a local agent session…")
+        mode = ("Tools are approved automatically with full local privileges" if auto_approve
+                else "I'll ask before running shell commands or changing files")
+        await interaction.response.send_message(
+            f"Reply in this thread to keep going. {mode}. Up to {max_turns} model calls per message. Not a sandbox."
+        )
         message = await interaction.original_response()
         thread = await message.create_thread(name="Agent session", auto_archive_duration=1440)
         self.db.execute("INSERT INTO sessions (thread, session, auto_approve, max_turns, workspace) VALUES (?, NULL, ?, ?, ?)",
@@ -201,12 +205,11 @@ class AgentBot(discord.Client):
             if auto_approve not in (0, 1) or not isinstance(max_turns, int) or not 1 <= max_turns <= 100:
                 raise ValueError("Invalid saved permission policy")
             payload = {"prompt": prompt, "session": saved, "auto_approve": bool(auto_approve), "max_turns": max_turns,
-                       "presentation": "\nDiscord presentation: give a concise final answer summarizing changes, checks, and blockers. Avoid tool-by-tool narration. Prefer under 200 words unless the user requests detail. Never omit important failures or risks."}
+                       "presentation": "\nDiscord presentation: reply directly and conversationally. For project work, mention relevant changes, checks, and blockers without a fixed template or tool-by-tool narration. Match the level of detail to the request. Never omit important failures or risks."}
             async with worker(BINARY, workspace or WORKSPACE, worker_env(), STATE, thread.id, payload) as handle:
-                mode = "auto approvals — full local privileges" if auto_approve else "approval buttons"
-                await thread.send(f"Working · {mode} · max {max_turns} model calls. Not a sandbox.")
                 done = False
                 limited = False
+                answered = False
                 async for event in handle.events():
                     self.runs.event(thread.id, event)
                     kind = event.get("type")
@@ -215,11 +218,12 @@ class AgentBot(discord.Client):
                         self.db.commit()
                     elif kind == "answer":
                         answer = event.get("text", "")
-                        if answer:
+                        if answer.strip():
                             if len(answer) > 1800:
-                                await thread.send("Agent response:", file=discord.File(io.BytesIO(answer.encode()), filename="answer.txt"))
+                                await thread.send("The full reply is attached.", file=discord.File(io.BytesIO(answer.encode()), filename="answer.txt"))
                             else:
                                 await thread.send(answer)
+                            answered = True
                     elif kind == "approval":
                         view = Approval()
                         arguments = json.dumps({"tool": event["name"], "arguments": event["args"]}, indent=2, ensure_ascii=False)
@@ -244,12 +248,15 @@ class AgentBot(discord.Client):
                     elif kind == "done":
                         done = True
                 code = await handle.process.wait()
-                if limited and done and code == 0:
+                if not done or code != 0:
+                    await thread.send(
+                        f"Turn stopped with an error (worker exit {code}). Saved context is retained; inspect local state before retrying. "
+                        f"Private local diagnostic: ~/.agent/discord/{Path(handle.diagnostic.name).name} (not uploaded)."
+                    )
+                elif limited:
                     await thread.send(f"Stopped at the {max_turns}-model-call cap. Completed changes remain; reply to continue with a fresh budget.")
-                    return
-                await thread.send("Turn complete. Reply here to continue." if done and code == 0 else
-                                  f"Turn stopped with an error (worker exit {code}). Saved context is retained; inspect local state before retrying. "
-                                  f"Private local diagnostic: ~/.agent/discord/{Path(handle.diagnostic.name).name} (not uploaded).")
+                elif not answered:
+                    await thread.send("I finished, but didn't get a reply to share.")
         except asyncio.CancelledError:
             try:
                 await thread.send("Cancelled. Effects may remain; inspect state before retrying.")

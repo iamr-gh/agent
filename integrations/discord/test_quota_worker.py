@@ -190,8 +190,7 @@ class QuotaWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Summarize the historical transcript", self.calls[2]["instructions"])
         self.assertIn("compact handoff", json.dumps(self.calls[3]["input"]))
         self.assertIn("latest task", json.dumps(self.calls[3]["input"]))
-        self.assertIn("task complete", self.messages())
-        self.assertIn("Turn complete", self.messages()[-1])
+        self.assertEqual(self.messages()[-1], "task complete")
 
     async def test_stop_during_fallback_sleep(self):
         self.replies = [quota()]

@@ -76,6 +76,23 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parameters["max_turns"].min_value, 1)
         self.assertEqual(parameters["max_turns"].max_value, 100)
 
+    async def test_start_announces_policy_once_in_thread_parent(self):
+        interaction = self.interaction()
+        interaction.id = 5678
+        self.thread.id = 4321  # The new thread has no saved session yet.
+        parent = SimpleNamespace(create_thread=AsyncMock(return_value=self.thread))
+        interaction.original_response = AsyncMock(return_value=parent)
+        interaction.channel = SimpleNamespace()
+        with patch.object(bot.discord, "TextChannel", SimpleNamespace), patch.object(self.client, "submit", AsyncMock()) as submit:
+            await self.client.start_session(interaction, "hello", max_turns=7)
+        parent.create_thread.assert_awaited_once()
+        interaction.response.send_message.assert_awaited_once()
+        notice = interaction.response.send_message.await_args.args[0]
+        self.assertIn("full local privileges", notice)
+        self.assertIn("7 model calls", notice)
+        submit.assert_awaited_once_with(self.thread, "hello")
+        self.thread.send.assert_not_awaited()
+
     async def test_owner_can_change_persistent_thread_policy(self):
         await self.client.settings(self.interaction(), True, 7)
         row = self.client.db.execute("SELECT auto_approve, max_turns FROM sessions WHERE thread=?", (self.thread.id,)).fetchone()
@@ -181,7 +198,27 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("DISCORD_BOT_TOKEN", spawn.call_args.kwargs["env"])
         row = self.client.db.execute("SELECT session FROM sessions WHERE thread=1234").fetchone()
         self.assertEqual(row[0], "test-session")
-        self.assertIn("Turn complete", self.thread.send.call_args.args[0])
+        self.thread.send.assert_awaited_once_with("hello")
+
+    async def test_long_and_empty_replies_get_one_message(self):
+        for answer in ("é" * 1801, " \n"):
+            with self.subTest(length=len(answer)):
+                self.thread.send.reset_mock()
+                stream = asyncio.StreamReader()
+                for event in [{"type": "answer", "text": answer}, {"type": "done"}]:
+                    stream.feed_data((json.dumps(event) + "\n").encode())
+                stream.feed_eof()
+                process = SimpleNamespace(stdout=stream, returncode=0, wait=AsyncMock(return_value=0),
+                                          stdin=SimpleNamespace(write=lambda _: None, drain=AsyncMock()))
+                with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=process)):
+                    await self.client.execute(self.thread, "task")
+                if answer.strip():
+                    self.assertEqual(self.thread.send.await_count, 1)
+                    attachment = self.thread.send.await_args.kwargs["file"]
+                    self.assertEqual(attachment.filename, "answer.txt")
+                    self.assertEqual(attachment.fp.getvalue().decode(), answer)
+                else:
+                    self.thread.send.assert_awaited_once_with("I finished, but didn't get a reply to share.")
 
     async def test_auto_policy_reaches_worker_and_limit_is_not_reported_as_failure(self):
         await self.client.settings(self.interaction(), True, 2)
