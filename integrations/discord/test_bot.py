@@ -72,7 +72,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row, (0, 25))
         parameters = {param.name: param for param in self.client.tree.get_command("agent").parameters}
         self.assertIs(parameters["auto_approve"].default, True)
-        self.assertEqual(parameters["max_turns"].default, 25)
+        self.assertEqual(parameters["max_turns"].default, 50)
         self.assertEqual(parameters["max_turns"].min_value, 1)
         self.assertEqual(parameters["max_turns"].max_value, 100)
 

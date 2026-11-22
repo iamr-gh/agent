@@ -25,7 +25,7 @@ Keep the process running; it does not install an automatic startup service. Glob
 
 ## Use
 
-- In a server text channel, run `/agent prompt:Describe this project`. New threads default to **automatic tool approvals** and **25 model calls per prompt**. You can explicitly choose `auto_approve:false` and `max_turns:10` (allowed range: 1–100).
+- In a server text channel, run `/agent prompt:Describe this project`. New threads default to **automatic tool approvals** and **50 model calls per prompt**. Existing threads keep their saved limits. You can explicitly choose `auto_approve:false` and `max_turns:10` (allowed range: 1–100).
 - The bot creates a public thread named after the opening request and shows a short excerpt in the opener. Reply in that thread to continue; only text is submitted (attachments are not ingested). Each reply gets a fresh model-call budget. At the cap, work stops without another inference request; completed changes and context remain, and the bot reports the limit rather than a generic error.
 - Auto mode permits every shell command and file change with full local account privileges, just like the CLI's `--yes`. **The cap counts model calls, not individual tool calls, runtime, money, or changes.** Each model response can contain multiple tool calls; a cap is not a security boundary.
 - Use `/agent_settings auto_approve:true max_turns:25` inside an existing agent thread to change its policy for subsequent prompts, or set `auto_approve:false` for buttons. Settings persist across restarts and can only be changed by the owner while the thread is idle. Threads created before this feature stay in manual mode until you explicitly change them.

@@ -114,7 +114,7 @@ class AgentBot(discord.Client):
     @app_commands.describe(auto_approve="Allow shell and file changes without buttons (full local privileges)",
                            max_turns="Maximum model calls per prompt, not a tool-call or cost cap (1–100)")
     async def start_session(self, interaction: discord.Interaction, prompt: str,
-                            auto_approve: bool = True, max_turns: app_commands.Range[int, 1, 100] = 25,
+                            auto_approve: bool = True, max_turns: app_commands.Range[int, 1, 100] = 50,
                             workspace: str = ""):
         if interaction.user.id != OWNER_ID or interaction.guild is None:
             await interaction.response.send_message("Not authorized; use your server.", ephemeral=True)
