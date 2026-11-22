@@ -42,6 +42,25 @@ def prompt_preview(prompt, limit):
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
+def answer_chunks(text):
+    limit = 2000
+    start = 0
+    while start < len(text):
+        # Count UTF-16 units conservatively without cutting a supplementary character in half.
+        chunk = text[start:start + limit].encode("utf-16-le")[:2 * limit].decode("utf-16-le", errors="ignore")
+        if start + len(chunk) < len(text):
+            # Prefer a line break, then a space, without making the message too short.
+            midpoint = len(chunk) // 2
+            boundary = chunk.rfind("\n", midpoint)
+            if boundary == -1:
+                boundary = chunk.rfind(" ", midpoint)
+            if boundary != -1:
+                chunk = chunk[:boundary + 1]
+        start += len(chunk)
+        if chunk.strip():
+            yield chunk
+
+
 class Approval(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=120)
@@ -310,11 +329,8 @@ class AgentBot(discord.Client):
                         self.db.commit()
                     elif kind == "answer":
                         answer = event.get("text", "")
-                        if answer.strip():
-                            if len(answer) > 1800:
-                                await thread.send("The full reply is attached.", file=discord.File(io.BytesIO(answer.encode()), filename="answer.txt"), **reply)
-                            else:
-                                await thread.send(answer, **reply)
+                        for index, chunk in enumerate(answer_chunks(answer)):
+                            await thread.send(chunk, **(reply if index == 0 else {}))
                             answered = True
                     elif kind == "approval":
                         view = Approval()

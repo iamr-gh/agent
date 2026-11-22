@@ -7,7 +7,7 @@ import signal
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import bot
 
@@ -34,6 +34,22 @@ class ConfigTests(unittest.TestCase):
     def test_worker_does_not_inherit_token(self):
         with patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "synthetic"}):
             self.assertNotIn("DISCORD_BOT_TOKEN", bot.worker_env())
+
+
+class AnswerChunkTests(unittest.TestCase):
+    def test_short_and_exact_limit_answers_stay_in_one_message(self):
+        for text in ("a " * 901, "x" * 2000, "😀" * 1000):
+            self.assertEqual(list(bot.answer_chunks(text)), [text])
+
+    def test_split_does_not_cut_emoji_in_half(self):
+        first = "x" * 1999
+        second = "😀" * 10
+        self.assertEqual(list(bot.answer_chunks(first + second)), [first, second])
+
+    def test_prefers_space_over_splitting_a_word(self):
+        first = "x" * 1997 + " "
+        second = "word"
+        self.assertEqual(list(bot.answer_chunks(first + second)), [first, second])
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -329,7 +345,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_and_empty_replies_link_to_the_prompt(self):
         reference = bot.discord.MessageReference(message_id=1, channel_id=self.thread.id, fail_if_not_exists=False)
-        for answer in ("é" * 1801, " \n"):
+        first = "é" * 1500 + "\n"
+        second = "x" * 2000
+        third = "tail"
+        for chunks in ((first, second, third), (" \n",)):
+            answer = "".join(chunks)
             with self.subTest(length=len(answer)):
                 self.thread.send.reset_mock()
                 stream = asyncio.StreamReader()
@@ -340,13 +360,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                                           stdin=SimpleNamespace(write=lambda _: None, drain=AsyncMock()))
                 with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=process)):
                     await self.client.execute(self.thread, "task", reference=reference)
-                self.assertIs(self.thread.send.await_args.kwargs["reference"], reference)
-                self.assertIs(self.thread.send.await_args.kwargs["mention_author"], False)
                 if answer.strip():
-                    self.assertEqual(self.thread.send.await_count, 1)
-                    attachment = self.thread.send.await_args.kwargs["file"]
-                    self.assertEqual(attachment.filename, "answer.txt")
-                    self.assertEqual(attachment.fp.getvalue().decode(), answer)
+                    self.assertEqual(self.thread.send.await_args_list, [
+                        call(first, reference=reference, mention_author=False), call(second), call(third),
+                    ])
                 else:
                     self.thread.send.assert_awaited_once_with("I finished, but didn't get a reply to share.",
                                                              reference=reference, mention_author=False)
