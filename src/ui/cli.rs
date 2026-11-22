@@ -1,7 +1,7 @@
 //! CLI configuration and terminal conversation controller.
 use super::{StreamDisplay, TerminalFrontend, input, live, styles_enabled};
 use crate::{
-    INTERRUPTED, Workspace, check_interrupt, compaction,
+    INTERRUPTED, Workspace, compaction,
     engine::text,
     runner::{TurnModel, connect, turn as turn_compacting},
     session::{self, Session, Store},
@@ -9,10 +9,11 @@ use crate::{
 };
 #[cfg(test)]
 use llm_api::Request;
-use llm_api::{Cancelled, Client, Provider, Result};
-use serde_json::json;
+use llm_api::{Cancelled, Client, Provider, Response, Result};
+use serde_json::{Value, json};
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub(crate) fn run() -> Result<()> {
     let mut provider = std::env::var("AGENT_PROVIDER").unwrap_or("codex".into());
@@ -57,6 +58,9 @@ pub(crate) fn run() -> Result<()> {
                 );
                 println!(
                     "ag [--provider openai|anthropic|openrouter|codex] [--model MODEL] [--ask|--yes] [--verbose] [--list-skills] [--resume ID] [--max-turns N] [--max-context-kib N] [--] [PROMPT...]\nDefaults: provider codex, model gpt-6.2-sol (overridable with AGENT_PROVIDER/AGENT_MODEL).\nLimits: 500 model calls per prompt, 4096 KiB serialized context (not a token limit; provider limits still apply).\nNo prompt: interactive conversation. /quit exits; /clear starts a new saved session.\n/model opens a searchable model picker; /model ID selects a custom model for the current provider. Switching starts a new saved session; availability depends on your account.\n/resume opens a searchable session picker (↑/↓, Enter, Esc); /resume ID restores one without replaying tools.\n/reload saves and restarts the executable at its current path, preserving context. Sessions are private files under $AGENT_HOME/sessions (default ~/.agent/sessions); they may contain sensitive tool output.\nTool calls are allowed without confirmation by default, including unsandboxed shell commands with full user privileges.\n--ask requires confirmation for shell commands and file writes; --yes restores automatic approval.\nTool activity is compact by default; --verbose shows full arguments and bounded results."
+                );
+                println!(
+                    "/retry retries the failed model request in the current interactive session."
                 );
                 return Ok(());
             }
@@ -167,6 +171,7 @@ fn chat_session(
         None
     };
     let mut typing = live::Typing::default();
+    let mut retry_pending = false;
     if session.store.is_some() {
         preview(&session, verbose);
     }
@@ -188,6 +193,7 @@ fn chat_session(
             match input.trim() {
                 "/compact" => {
                     let busy = typing.busy()?;
+                    let before = session.request.messages.len();
                     let result = compaction::manual(
                         &mut session.request,
                         &client,
@@ -202,11 +208,20 @@ fn chat_session(
                         eprintln!("compaction cancelled");
                     } else {
                         result?;
+                        if session.request.messages.len() != before {
+                            retry_pending = false;
+                        }
                     }
                     continue;
                 }
                 "/quit" => break,
+                "/retry" if retry_pending => None,
+                "/retry" => {
+                    eprintln!("no failed provider request to retry in this session");
+                    continue;
+                }
                 "/clear" => {
+                    retry_pending = false;
                     session.request.messages.clear();
                     if session.store.is_some() {
                         session.store = Some(Store::create(
@@ -237,6 +252,9 @@ fn chat_session(
                             .transpose()
                     }) {
                         Ok(Some(changed)) => {
+                            if changed {
+                                retry_pending = false;
+                            }
                             eprintln!(
                                 "Model: {}{}",
                                 super::display(&session.request.model),
@@ -317,6 +335,7 @@ fn chat_session(
                     {
                         Ok((saved, saved_provider, saved_client)) => {
                             session = saved;
+                            retry_pending = false;
                             provider = saved_provider;
                             client = saved_client;
                             preview(&session, verbose);
@@ -328,15 +347,22 @@ fn chat_session(
                     continue;
                 }
                 "" => continue,
-                _ => input,
+                _ => Some(input),
             }
         } else {
-            prompt.join(" ")
+            Some(prompt.join(" "))
         };
-        session.request.messages.push(text("user", input));
+        retry_pending = false;
+        let mut skip_compaction = input.is_none();
+        let mut compact =
+            compaction::automatic(session.store.as_ref(), compact_threshold, compaction_notice);
+        if let Some(input) = input {
+            session.request.messages.push(text("user", input));
+        }
         session.save(true)?;
         let store = &session.store;
         let mut checkpoint_failed = false;
+        let mut provider_failed = false;
         let busy = if interactive { typing.busy()? } else { None };
         let result = turn_compacting(
             &mut session.request,
@@ -344,26 +370,40 @@ fn chat_session(
             max_turns,
             max_context_bytes,
             TurnModel::new(&mut client, store.as_ref()),
-            compaction::automatic(store.as_ref(), compact_threshold, compaction_notice),
+            |client, request| {
+                // Resend the saved context before attempting any new compaction.
+                if std::mem::take(&mut skip_compaction) {
+                    Ok(compaction::Automatic::NotNeeded)
+                } else {
+                    compact(client, request)
+                }
+            },
             |client, req| {
                 let styled = styles_enabled(io::stdout().is_terminal());
                 let mut stream = StreamDisplay::new(styled);
                 let mut displayed = false;
-                let result = client.run_cancellable(req, &INTERRUPTED, |event| {
-                    if check_interrupt().is_err() {
-                        return false;
-                    }
-                    let chunk = stream.delta(&event);
-                    if !chunk.is_empty() {
-                        displayed = true;
-                        return live::output(&chunk, false).is_ok();
-                    }
-                    true
-                });
-                if result
-                    .as_ref()
-                    .is_err_and(|error| error.is::<llm_api::CodexQuota>())
-                {
+                let result = retry_model(
+                    &INTERRUPTED,
+                    |emit| client.run_cancellable(req, &INTERRUPTED, emit),
+                    |event| {
+                        let chunk = stream.delta(&event);
+                        if !chunk.is_empty() {
+                            displayed = true;
+                            return live::output(&chunk, false).is_ok();
+                        }
+                        true
+                    },
+                    |error| {
+                        let _ = live::output(
+                            &format!(
+                                "Temporary provider failure ({}); retrying request once\n",
+                                super::display(&error.to_string())
+                            ),
+                            true,
+                        );
+                    },
+                );
+                if result.is_err() {
                     // Already printed deltas cannot be retracted. Do not flush any
                     // buffered text, and mark the visible part as discarded.
                     if displayed {
@@ -372,6 +412,11 @@ fn chat_session(
                 } else {
                     live::output(&stream.finish(), false)?;
                 }
+                // Quota errors are handled by the runner, whose wait or login
+                // reload can fail for reasons unrelated to this model request.
+                provider_failed = result.as_ref().is_err_and(|error| {
+                    !error.is::<Cancelled>() && !error.is::<llm_api::CodexQuota>()
+                });
                 result
             },
             |request| {
@@ -402,6 +447,20 @@ fn chat_session(
             }
             continue;
         }
+        if provider_failed {
+            // The failed model request did not append a response or run tools.
+            // All effects from earlier successful requests are already checkpointed.
+            session.save(false)?;
+            if interactive {
+                let Err(error) = result else { unreachable!() };
+                eprintln!(
+                    "Provider error: {}. Type /retry to resume from the saved context, or enter a new prompt.",
+                    super::display(&error.to_string())
+                );
+                retry_pending = true;
+                continue;
+            }
+        }
         result?;
         session.save(false)?;
         if !interactive {
@@ -409,6 +468,40 @@ fn chat_session(
         }
     }
     Ok(())
+}
+
+// Retry only the current model call, never a turn or any completed tools.
+fn retry_model(
+    cancelled: &AtomicBool,
+    mut run: impl FnMut(&mut dyn FnMut(Value) -> bool) -> Result<Response>,
+    mut emit: impl FnMut(Value) -> bool,
+    on_retry: impl FnOnce(&(dyn std::error::Error + 'static)),
+) -> Result<Response> {
+    let mut received_event = false;
+    let result = run(&mut |event| {
+        received_event = true;
+        emit(event)
+    });
+    match result {
+        Err(error) if !received_event && llm_api::is_transient(error.as_ref()) => {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(Cancelled.into());
+            }
+            on_retry(error.as_ref());
+            let until = Instant::now() + Duration::from_millis(400);
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(Cancelled.into());
+                }
+                let Some(remaining) = until.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                std::thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+            run(&mut emit)
+        }
+        result => result,
+    }
 }
 
 fn compaction_notice(message: &str) {
@@ -428,4 +521,121 @@ fn preview(session: &Session, verbose: bool) {
             verbose,
         )
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn transient_failure_gets_one_retry_and_no_more() {
+        let cancelled = AtomicBool::new(false);
+        let mut attempts = 0;
+        let error = retry_model(
+            &cancelled,
+            |_| {
+                attempts += 1;
+                Err(io::Error::from(ErrorKind::ConnectionReset).into())
+            },
+            |_| panic!("no stream events"),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert!(llm_api::is_transient(error.as_ref()));
+    }
+
+    #[test]
+    fn no_automatic_retry_after_an_event_or_on_permanent_error() {
+        let cancelled = AtomicBool::new(false);
+        for emit_first in [true, false] {
+            let mut attempts = 0;
+            let mut observed = 0;
+            let result = retry_model(
+                &cancelled,
+                |emit| {
+                    attempts += 1;
+                    if emit_first {
+                        emit(json!({"type":"text_delta","delta":"partial"}));
+                        Err(io::Error::from(ErrorKind::ConnectionReset).into())
+                    } else {
+                        Err("permanent error".into())
+                    }
+                },
+                |_| {
+                    observed += 1;
+                    true
+                },
+                |_| panic!("must not retry"),
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+            assert_eq!(observed, usize::from(emit_first));
+        }
+    }
+
+    #[test]
+    fn retry_after_tool_result_only_repeats_the_model_call() {
+        use crate::tests::{Fixture, call, request, response};
+
+        let cancelled = AtomicBool::new(false);
+        let fixture = Fixture::new();
+        let mut request = request();
+        let mut attempts = 0;
+        crate::engine::turn_saved(
+            &mut request,
+            &fixture.0,
+            2,
+            1024 * 1024,
+            |req| {
+                retry_model(
+                    &cancelled,
+                    |_| {
+                        attempts += 1;
+                        if attempts == 1 {
+                            return Ok(response(
+                                vec![call("a", "shell", json!({"command":"printf x >> marker"}))],
+                                "tool_calls",
+                            ));
+                        }
+                        assert_eq!(req.messages.len(), 3);
+                        assert_eq!(req.messages[2].content[0]["id"], "a");
+                        assert_eq!(req.messages[2].content[0]["is_error"], false);
+                        if attempts == 2 {
+                            return Err(io::Error::from(ErrorKind::ConnectionReset).into());
+                        }
+                        Ok(response(vec![], "stop"))
+                    },
+                    |_| true,
+                    |_| {},
+                )
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.root.join("marker")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_backoff_prevents_retry() {
+        let cancelled = AtomicBool::new(false);
+        let mut attempts = 0;
+        let error = retry_model(
+            &cancelled,
+            |_| {
+                attempts += 1;
+                Err(io::Error::from(ErrorKind::ConnectionReset).into())
+            },
+            |_| panic!("no stream events"),
+            |_| cancelled.store(true, Ordering::Relaxed),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.is::<Cancelled>());
+    }
 }

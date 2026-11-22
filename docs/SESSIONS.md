@@ -25,6 +25,8 @@ Before executing an assistant batch, save its intact message and one ordered res
 
 Loading an active snapshot adds one recovery notice and marks it inactive. Completed results survive; unknown/not-executed results remain explicit. No saved call is automatically executed. A crash after an effect but before saving its result cannot be distinguished from a failed/unstarted effect: inspect workspace state before retrying. This is deliberately not an exactly-once guarantee. Partial streaming text is display-only until a complete model response is accepted.
 
+If a model request fails, `ag` retries it once after a short delay for recognized transient failures, but only if no stream event arrived. If the request still fails, the interactive prompt stays open and `/retry` sends the same saved context without adding a user message or replaying completed tools. Noninteractive runs exit with an error. Error diagnostics omit raw provider payloads.
+
 These files can contain sensitive source, prompts, or command output; private permissions are not encryption. No automatic retention/deletion is implemented.
 
 ## Offline verification

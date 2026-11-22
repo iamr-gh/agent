@@ -367,6 +367,43 @@ fn assert_closed(stream: &mut TcpStream) {
 }
 
 #[test]
+fn provider_error_returns_to_prompt_and_retry_reuses_context() {
+    let fixture = Fixture::new();
+    let server = Server::new();
+    let mut process = Process::spawn(&fixture, &server.endpoint(), true, false);
+    process.expect("> ");
+    process.send("task\n");
+    let (mut stream, original) = server.request();
+    stream
+        .write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+    drop(stream);
+    process.expect("retrying request once");
+    let (mut stream, automatic_retry) = server.request();
+    assert_eq!(automatic_retry, original);
+    let failure = "data: {\"type\":\"error\",\"code\":\"invalid_request_error\"}\n\n";
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{failure}", failure.len()).unwrap();
+    drop(stream);
+    process.expect("code: invalid_request_error");
+    process.expect("Type /retry");
+    process.expect("> ");
+    process.send("/retry\n");
+    let (stream, retried) = server.request();
+    assert_eq!(retried, original);
+    done(stream);
+    process.expect("> ");
+    process
+        .terminal
+        .as_mut()
+        .unwrap()
+        .write_all(b"/quit\r")
+        .unwrap();
+    assert_eq!(process.wait().code(), Some(0));
+}
+
+#[test]
 fn long_input_backspaces_across_viewports_and_submits_exact_text() {
     let fixture = Fixture::new();
     let server = Server::new();
