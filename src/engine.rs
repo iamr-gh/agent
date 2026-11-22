@@ -1,5 +1,8 @@
 //! Agent and tool logic. No terminal I/O or presentation dependencies.
-use crate::skills;
+use crate::{
+    session::{Store, history},
+    skills,
+};
 use llm_api::{Message, Request, Response, Result};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -82,6 +85,12 @@ fn field<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 pub(crate) fn tools() -> Vec<Value> {
+    let mut tools = legacy_tools();
+    tools.extend(history::schemas());
+    tools
+}
+
+pub(crate) fn legacy_tools() -> Vec<Value> {
     [
         ("load_skill", "Load an installed skill's instructions by exact catalog name. Read-only; includes its directory for relative references.", vec!["name"], json!({"name":{"type":"string"}})),
         ("read_file", "Read UTF-8 text, at most 32 KiB per result. Optional 1-based start_line and line_count (default 200).", vec!["path"], json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1}})),
@@ -93,6 +102,62 @@ pub(crate) fn tools() -> Vec<Value> {
             "type":"object","properties":properties,"required":required,"additionalProperties":false
         }
     })).collect()
+}
+
+fn validate_tool(name: &str, args: &Value) -> Result<()> {
+    let schema = tools()
+        .into_iter()
+        .find(|tool| tool["name"] == name)
+        .ok_or("unknown tool")?;
+    let object = args.as_object().ok_or("arguments must be an object")?;
+    let props = schema["parameters"]["properties"].as_object().unwrap();
+    for (key, value) in object {
+        let spec = props.get(key).ok_or("unknown argument")?;
+        if spec["type"] == "string" && !value.is_string()
+            || spec["type"] == "integer"
+                && value.as_u64().is_none_or(|n| {
+                    n < spec["minimum"].as_u64().unwrap_or(0)
+                        || n > spec["maximum"].as_u64().unwrap_or(u64::MAX)
+                })
+        {
+            return Err("invalid argument type or range".into());
+        }
+    }
+    for key in schema["parameters"]["required"].as_array().unwrap() {
+        if !object.contains_key(key.as_str().unwrap()) {
+            return Err(format!("missing required argument {key}").into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn history_tool_argument_bounds() {
+    for args in [
+        json!({}),
+        json!({"query":"x","limit":0}),
+        json!({"query":"x","limit":11}),
+        json!({"query":"x","limit":1.5}),
+        json!({"query":"x","workspace":"elsewhere"}),
+    ] {
+        assert!(validate_tool(history::SEARCH, &args).is_err(), "{args}");
+    }
+    for args in [
+        json!({"session_id":"old"}),
+        json!({"session_id":"old","message":0}),
+        json!({"session_id":"old","message":1,"offset":-1}),
+    ] {
+        assert!(validate_tool(history::EXCERPT, &args).is_err(), "{args}");
+    }
+    assert!(validate_tool(history::SEARCH, &json!({"query":"x","limit":10})).is_ok());
+    assert!(
+        validate_tool(
+            history::EXCERPT,
+            &json!({"session_id":"old","message":1,"offset":0})
+        )
+        .is_ok()
+    );
 }
 
 pub(crate) struct Workspace {
@@ -144,23 +209,7 @@ impl Workspace {
 
     pub(crate) fn execute(&self, name: &str, args: &Value) -> Result<String> {
         check_interrupt()?;
-        let schema = tools()
-            .into_iter()
-            .find(|tool| tool["name"] == name)
-            .ok_or("unknown tool")?;
-        let object = args.as_object().ok_or("arguments must be an object")?;
-        let props = schema["parameters"]["properties"].as_object().unwrap();
-        for (key, value) in object {
-            let spec = props.get(key).ok_or("unknown argument")?;
-            if spec["type"] == "string" && !value.is_string()
-                || spec["type"] == "integer" && value.as_u64().filter(|n| *n > 0).is_none()
-            {
-                return Err("invalid argument type or range".into());
-            }
-        }
-        for key in schema["parameters"]["required"].as_array().unwrap() {
-            field(args, key.as_str().unwrap())?;
-        }
+        validate_tool(name, args)?;
         if name == "load_skill" {
             return skills::load(self, field(args, "name")?);
         }
@@ -387,17 +436,20 @@ pub(crate) fn turn_saved(
         workspace,
         max_turns,
         max_context_bytes,
+        None,
         |_| Ok(false),
         |_, input| infer(input),
         checkpoint,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn turn_compacting(
     request: &mut Request,
     workspace: &Workspace,
     max_turns: usize,
     max_context_bytes: usize,
+    store: Option<&Store>,
     mut compact: impl FnMut(&mut Request) -> Result<bool>,
     mut infer: impl FnMut(&Request, &Request) -> Result<Response>,
     mut checkpoint: impl FnMut(&Request) -> Result<()>,
@@ -487,6 +539,16 @@ pub(crate) fn turn_compacting(
                 if page_tool_output && name == crate::tool_history::TOOL {
                     check_interrupt()?;
                     crate::tool_history::page(request, &call["arguments"])
+                } else if matches!(name, history::SEARCH | history::EXCERPT) {
+                    check_interrupt()?;
+                    let args = &call["arguments"];
+                    validate_tool(name, args)?;
+                    let store = store.ok_or("history lookup requires a saved session")?;
+                    if name == history::SEARCH {
+                        history::search(store, args)
+                    } else {
+                        history::excerpt(store, args)
+                    }
                 } else {
                     workspace.execute(name, &call["arguments"])
                 }

@@ -297,6 +297,7 @@ mod tests {
             &workspace.0,
             3,
             1 << 20,
+            None,
             |request| {
                 if calls.get() == 0 {
                     return Ok(false);

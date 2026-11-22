@@ -1,5 +1,8 @@
 //! Atomic context snapshots, not terminal logs. Loading never executes saved calls.
-use crate::engine::{atomic_write, text, tools};
+use crate::engine::{atomic_write, legacy_tools, text, tools};
+
+#[path = "session_history.rs"]
+pub(crate) mod history;
 use llm_api::{Provider, Request, Result};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
@@ -43,7 +46,10 @@ pub(crate) fn directory() -> Result<PathBuf> {
 }
 
 fn private(path: &Path, directory: bool) -> Result<()> {
-    let meta = fs::symlink_metadata(path)?;
+    private_metadata(&fs::symlink_metadata(path)?, directory)
+}
+
+fn private_metadata(meta: &fs::Metadata, directory: bool) -> Result<()> {
     // SAFETY: getuid only reads the real user ID.
     if meta.uid() != unsafe { libc::getuid() }
         || meta.mode() & 0o077 != 0
@@ -58,9 +64,13 @@ fn private(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+}
+
 impl Store {
     fn open(root: &Path, workspace: &Path, provider: Provider, id: &str) -> Result<Self> {
-        if id.is_empty() || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+        if !valid_id(id) {
             return Err("invalid session ID".into());
         }
         private(root, true)?;
@@ -128,7 +138,12 @@ impl Store {
         }
         let provider: Provider = serde_json::from_value(data["provider"].clone())?;
         let mut request: Request = serde_json::from_value(data["request"].clone())?;
-        if request.tools != tools() {
+        let current_tools = tools();
+        if request.tools == legacy_tools() {
+            // The two history tools are additive; all previously advertised tools
+            // keep their exact schemas. Reject any other mismatch as before.
+            request.tools = current_tools;
+        } else if request.tools != current_tools {
             return Err(
                 "saved tool schemas differ from this executable; cannot safely resume".into(),
             );

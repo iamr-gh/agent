@@ -234,6 +234,7 @@ pub(crate) fn turn(
     mut infer: impl FnMut(&Client, &Request) -> Result<Response>,
     checkpoint: impl FnMut(&Request) -> Result<()>,
 ) -> Result<()> {
+    let store = model.store;
     let state = RefCell::new(ActiveTurn {
         model,
         workspace,
@@ -245,6 +246,7 @@ pub(crate) fn turn(
         workspace,
         max_turns,
         max_context_bytes,
+        store,
         |request| loop {
             engine::check_interrupt()?;
             let mut state = state.borrow_mut();
