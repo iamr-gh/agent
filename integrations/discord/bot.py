@@ -1,5 +1,7 @@
 """Single-owner Discord frontend. Start with the private venv described in docs/DISCORD.md."""
 import asyncio
+from collections import deque
+from contextlib import suppress
 import io
 import json
 import os
@@ -33,6 +35,11 @@ def read_token(path=CONFIG):
 def worker_env():
     # Never pass the bot token to the model worker or its shell children.
     return {k: v for k, v in os.environ.items() if k != "DISCORD_BOT_TOKEN"}
+
+
+def prompt_preview(prompt, limit):
+    text = " ".join(prompt.split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
 class Approval(discord.ui.View):
@@ -74,6 +81,7 @@ class AgentBot(discord.Client):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
         self.runs = Runs()
+        self.drains = {}
         STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(STATE / "state.sqlite3")
         self.db.execute("CREATE TABLE IF NOT EXISTS sessions (thread INTEGER PRIMARY KEY, session TEXT)")
@@ -88,7 +96,7 @@ class AgentBot(discord.Client):
         self.db.execute("CREATE TABLE IF NOT EXISTS seen (id INTEGER PRIMARY KEY)")
         self.db.commit()
         self.tree.command(name="agent", description="Start an agent thread in an existing local workspace")(self.start_session)
-        self.tree.command(name="agent_stop", description="Cancel this thread's active agent turn")(self.stop_turn)
+        self.tree.command(name="agent_stop", description="Cancel this thread's active turn and clear queued replies")(self.stop_turn)
         self.tree.command(name="agent_settings", description="Set approval mode and per-prompt model-call cap for this thread")(self.settings)
         self.tree.command(name="agent_status", description="Show this session's run status and workspace")(self.status)
 
@@ -127,15 +135,19 @@ class AgentBot(discord.Client):
             return
         mode = ("Tools are approved automatically with full local privileges" if auto_approve
                 else "I'll ask before running shell commands or changing files")
+        preview = discord.utils.escape_markdown(prompt_preview(prompt, 240), ignore_links=False)
         await interaction.response.send_message(
-            f"Reply in this thread to keep going. {mode}. Up to {max_turns} model calls per message. Not a sandbox."
+            f"**Request:** {preview}\n\n"
+            f"Reply in this thread to keep going. {mode}. Up to {max_turns} model calls per message. Not a sandbox.",
+            allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )
         message = await interaction.original_response()
-        thread = await message.create_thread(name="Agent session", auto_archive_duration=1440)
+        title = prompt_preview(prompt, 60)
+        thread = await message.create_thread(name=f"Agent: {title}" if title else "Agent session", auto_archive_duration=1440)
         self.db.execute("INSERT INTO sessions (thread, session, auto_approve, max_turns, workspace) VALUES (?, NULL, ?, ?, ?)",
                         (thread.id, int(auto_approve), max_turns, str(root)))
         self.db.commit()
-        await self.submit(thread, prompt)
+        await self.enqueue(thread, prompt, message)
 
     @app_commands.describe(auto_approve="Allow shell and file changes without buttons (full local privileges)",
                            max_turns="Maximum model calls per prompt (1–100); resets on each reply")
@@ -166,21 +178,57 @@ class AgentBot(discord.Client):
             return
         if self.seen(message.id):
             return
-        await self.submit(message.channel, message.content)
+        await self.enqueue(message.channel, message.content, message)
 
-    async def submit(self, thread, prompt):
+    async def enqueue(self, thread, prompt, message):
+        if thread.id in self.drains:
+            task, pending = self.drains[thread.id]
+            if task.cancelling():
+                await thread.send("This thread is still stopping. Resend when ready.")
+            else:
+                pending.append((prompt, message))
+            return
+        # Keep the FIFO at Discord ingress; Runs still rejects session and checkout contention.
+        pending = deque()
+        self.drains[thread.id] = (asyncio.current_task(), pending)
+        try:
+            while await self.submit(thread, prompt, message) and pending:
+                prompt, message = pending.popleft()
+        finally:
+            self.drains.pop(thread.id)
+        if pending:
+            await thread.send(f"Cleared {len(pending)} queued replies because work stopped. Resend them when ready.")
+
+    async def submit(self, thread, prompt, message=None):
         row = self.db.execute("SELECT workspace FROM sessions WHERE thread=?", (thread.id,)).fetchone()
         try:
-            await self.runs.submit(thread.id, row[0] or WORKSPACE, lambda: self.execute(thread, prompt))
+            return await self.runs.submit(thread.id, row[0] or WORKSPACE, lambda: self.run_turn(thread, prompt, message))
         except (Busy, OSError) as error:
             await thread.send(f"Not started: {error} Resend when ready.")
+            return False
+
+    async def run_turn(self, thread, prompt, message):
+        try:
+            if message is not None:
+                with suppress(discord.HTTPException, OSError):
+                    await asyncio.wait_for(message.add_reaction("⏳"), timeout=3)
+            # The slash-command opener lives in the parent channel, not in this thread.
+            reference = (message.to_reference(fail_if_not_exists=False)
+                         if message is not None and message.channel.id == thread.id else None)
+            return await self.execute(thread, prompt, reference=reference)
+        finally:
+            if message is not None and self.user is not None:
+                with suppress(discord.HTTPException, OSError):
+                    await asyncio.wait_for(message.remove_reaction("⏳", self.user), timeout=3)
 
     async def status(self, interaction: discord.Interaction):
         if interaction.user.id != OWNER_ID or interaction.guild is None:
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
         row = self.db.execute("SELECT workspace FROM sessions WHERE thread=?", (interaction.channel_id,)).fetchone()
-        text = (f"{self.runs.status(interaction.channel_id)} · {row[0] or WORKSPACE}" if row
+        drain = self.drains.get(interaction.channel_id)
+        queued = len(drain[1]) if drain else 0
+        text = (f"{self.runs.status(interaction.channel_id)} · {queued} queued · {row[0] or WORKSPACE}" if row
                 else "Use this command inside an agent thread.")
         await interaction.response.send_message(text, ephemeral=True)
 
@@ -188,16 +236,33 @@ class AgentBot(discord.Client):
         if interaction.user.id != OWNER_ID or interaction.guild is None:
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
-        if self.runs.cancel(interaction.channel_id):
-            await interaction.response.send_message("Cancelling this thread. Completed changes are not rolled back.", ephemeral=True)
+        cancelled, cleared = self.cancel_thread(interaction.channel_id)
+        if cancelled:
+            await interaction.response.send_message(
+                f"Cancelling this thread. Cleared {cleared} queued replies. Completed changes are not rolled back.",
+                ephemeral=True)
         else:
             await interaction.response.send_message("No active turn.", ephemeral=True)
 
+    def cancel_thread(self, thread_id):
+        drain = self.drains.get(thread_id)
+        if drain is None:
+            return self.runs.cancel(thread_id), 0
+        task, pending = drain
+        cleared = len(pending)
+        pending.clear()
+        # Don't interrupt subprocess or reaction cleanup with a second cancellation.
+        if not task.cancelling():
+            task.cancel()
+        return True, cleared
+
     async def on_disconnect(self):
         # No unobserved work or pending approval survives loss of Discord connectivity.
-        self.runs.cancel_all()
+        for thread_id in self.drains.keys() | self.runs.active.keys():
+            self.cancel_thread(thread_id)
 
-    async def execute(self, thread, prompt):
+    async def execute(self, thread, prompt, *, reference=None):
+        reply = {"reference": reference, "mention_author": False} if reference is not None else {}
         view = None
         try:
             saved, auto_approve, max_turns, workspace = self.db.execute(
@@ -220,9 +285,9 @@ class AgentBot(discord.Client):
                         answer = event.get("text", "")
                         if answer.strip():
                             if len(answer) > 1800:
-                                await thread.send("The full reply is attached.", file=discord.File(io.BytesIO(answer.encode()), filename="answer.txt"))
+                                await thread.send("The full reply is attached.", file=discord.File(io.BytesIO(answer.encode()), filename="answer.txt"), **reply)
                             else:
-                                await thread.send(answer)
+                                await thread.send(answer, **reply)
                             answered = True
                     elif kind == "approval":
                         view = Approval()
@@ -253,10 +318,12 @@ class AgentBot(discord.Client):
                         f"Turn stopped with an error (worker exit {code}). Saved context is retained; inspect local state before retrying. "
                         f"Private local diagnostic: ~/.agent/discord/{Path(handle.diagnostic.name).name} (not uploaded)."
                     )
-                elif limited:
-                    await thread.send(f"Stopped at the {max_turns}-model-call cap. Completed changes remain; reply to continue with a fresh budget.")
+                    return False
+                if limited:
+                    await thread.send(f"Stopped at the {max_turns}-model-call cap. Completed changes remain; reply to continue with a fresh budget.", **reply)
                 elif not answered:
-                    await thread.send("I finished, but didn't get a reply to share.")
+                    await thread.send("I finished, but didn't get a reply to share.", **reply)
+            return True
         except asyncio.CancelledError:
             try:
                 await thread.send("Cancelled. Effects may remain; inspect state before retrying.")
@@ -268,6 +335,7 @@ class AgentBot(discord.Client):
                 await thread.send("Discord/worker error. Work stopped; saved context is retained.")
             except discord.HTTPException:
                 pass
+            return False
         finally:
             if view is not None:
                 view.stop()
