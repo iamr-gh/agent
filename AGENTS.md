@@ -31,6 +31,6 @@ Inspect the destination before relinking. If it is an existing non-symlink file 
 
 ## Commits and delivery
 
-Commit completed, verified changes with descriptive messages explaining the behavior and relevant tests. Include only task-related changes. Push only when the user requests it; never force-push without explicit approval.
+Commit completed, verified changes with descriptive messages explaining the behavior and relevant tests. Include only task-related changes. The user requests that validated commits in this repository be pushed to the branch's configured upstream immediately, unless they ask otherwise. Never force-push without explicit approval.
 
 Report the commit, exact checks and outcomes, build/relink status, and any blockers. Do not claim a command succeeded without tool evidence.
